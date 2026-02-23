@@ -1,0 +1,19 @@
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Datasets & Large Files
+dataset/
+oxford_pets/
+results/
+
+# Logs & WandB
+wandb/
+*.log
+
+# Python Caches
+__pycache__/
+*.pyc
+.DS_Store

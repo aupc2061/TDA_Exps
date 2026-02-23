@@ -16,8 +16,38 @@ try:
 except ImportError:
     BICUBIC = Image.BICUBIC
 
+
+def resolve_device(device='auto'):
+    if isinstance(device, torch.device):
+        return device
+
+    requested = str(device).lower()
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return torch.device('mps')
+        return torch.device('cpu')
+
+    if requested == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError('CUDA requested but not available.')
+        return torch.device('cuda')
+
+    if requested == 'mps':
+        if not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+            raise RuntimeError('MPS requested but not available.')
+        return torch.device('mps')
+
+    if requested == 'cpu':
+        return torch.device('cpu')
+
+    raise ValueError(f'Unknown device option: {device}')
+
 def get_entropy(loss, clip_weights):
-    max_entropy = math.log2(clip_weights.size(1))
+    # Use natural log (math.log) to match x.log_softmax() which uses natural log.
+    # This ensures normalized_entropy is strictly bounded between [0, 1].
+    max_entropy = math.log(clip_weights.size(1))
     return float(loss / max_entropy)
 
 
@@ -36,12 +66,15 @@ def avg_entropy(outputs):
 def cls_acc(output, target, topk=1):
     pred = output.topk(topk, 1, True, True)[1].t()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
-    acc = float(correct[: topk].reshape(-1).float().sum(0, keepdim=True).cpu().numpy())
+    acc = correct[: topk].reshape(-1).float().sum().item()
     acc = 100 * acc / target.shape[0]
     return acc
 
 
-def clip_classifier(classnames, template, clip_model):
+def clip_classifier(classnames, template, clip_model, device=None):
+    if device is None:
+        device = next(clip_model.parameters()).device
+
     with torch.no_grad():
         clip_weights = []
 
@@ -49,7 +82,7 @@ def clip_classifier(classnames, template, clip_model):
             # Tokenize the prompts
             classname = classname.replace('_', ' ')
             texts = [t.format(classname) for t in template]
-            texts = clip.tokenize(texts).cuda()
+            texts = clip.tokenize(texts).to(device)
             # prompt ensemble for ImageNet
             class_embeddings = clip_model.encode_text(texts)
             class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
@@ -57,16 +90,19 @@ def clip_classifier(classnames, template, clip_model):
             class_embedding /= class_embedding.norm()
             clip_weights.append(class_embedding)
 
-        clip_weights = torch.stack(clip_weights, dim=1).cuda()
+        clip_weights = torch.stack(clip_weights, dim=1).to(device)
     return clip_weights
 
 
-def get_clip_logits(images, clip_model, clip_weights):
+def get_clip_logits(images, clip_model, clip_weights, device=None):
+    if device is None:
+        device = next(clip_model.parameters()).device
+
     with torch.no_grad():
         if isinstance(images, list):
-            images = torch.cat(images, dim=0).cuda()
+            images = torch.cat(images, dim=0).to(device)
         else:
-            images = images.cuda()
+            images = images.to(device)
 
         image_features = clip_model.encode_image(images)
         image_features /= image_features.norm(dim=-1, keepdim=True)
@@ -124,19 +160,19 @@ def get_config_file(config_path, dataset_name):
     return cfg
 
 
-def build_test_data_loader(dataset_name, root_path, preprocess):
+def build_test_data_loader(dataset_name, root_path, preprocess, shuffle=True):
     if dataset_name == 'I':
         dataset = ImageNet(root_path, preprocess)
-        test_loader = torch.utils.data.DataLoader(dataset.test, batch_size=1, num_workers=8, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(dataset.test, batch_size=1, num_workers=8, shuffle=shuffle)
     
     elif dataset_name in ['A','V','R','S']:
         preprocess = get_ood_preprocess()
         dataset = build_dataset(f"imagenet-{dataset_name.lower()}", root_path)
-        test_loader = build_data_loader(data_source=dataset.test, batch_size=1, is_train=False, tfm=preprocess, shuffle=True)
+        test_loader = build_data_loader(data_source=dataset.test, batch_size=1, is_train=False, tfm=preprocess, shuffle=shuffle)
 
     elif dataset_name in ['caltech101','dtd','eurosat','fgvc','food101','oxford_flowers','oxford_pets','stanford_cars','sun397','ucf101']:
         dataset = build_dataset(dataset_name, root_path)
-        test_loader = build_data_loader(data_source=dataset.test, batch_size=1, is_train=False, tfm=preprocess, shuffle=True)
+        test_loader = build_data_loader(data_source=dataset.test, batch_size=1, is_train=False, tfm=preprocess, shuffle=shuffle)
     
     else:
         raise "Dataset is not from the chosen list"

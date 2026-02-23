@@ -35,6 +35,8 @@ conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit
 pip install -r requirements.txt
 ```
 
+For Apple Silicon (M-series) with `mps`, use a recent PyTorch build (2.x recommended) instead of the legacy CUDA stack above.
+
 ### Dataset
 To set up all required datasets, kindly refer to the guidance in [DATASETS.md](docs/DATASETS.md), which incorporates steps for two benchmarks.
 
@@ -71,6 +73,38 @@ bash ./scripts/run_cd_benchmark_rn50.sh
 ```
 bash ./scripts/run_cd_benchmark_vit.sh 
 ```
+
+### Streaming Memory Benchmark (Cache vs SSM)
+To compare the original finite cache against the Mamba-style state-space memory on long streams:
+
+* **Run baseline TDA or SSM in `tda_runner.py`:**
+```
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type cache
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm
+```
+
+On Apple Silicon, add `--device mps`:
+```
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type cache --device mps
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm --device mps
+```
+
+* **Run head-to-head benchmark across stream lengths and cache sizes:**
+```
+bash ./scripts/run_stream_benchmark_rn50.sh
+bash ./scripts/run_stream_benchmark_vit.sh
+```
+
+Or directly with explicit device:
+```
+python stream_benchmark.py --config configs --datasets I --backbone RN50 --device mps
+```
+
+The benchmark script saves:
+* `summary.csv`: accuracy, forgetting (final/mean), runtime, and memory metrics.
+* `curves.csv`: cumulative-accuracy and forgetting curves over stream steps.
+* `report.json`: full structured results.
+* `*.png` plots (if matplotlib is installed): accuracy-vs-stream-length and forgetting curves.
 
 
 ### Results
