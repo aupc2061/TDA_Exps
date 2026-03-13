@@ -77,10 +77,22 @@ bash ./scripts/run_cd_benchmark_vit.sh
 ### Streaming Memory Benchmark (Cache vs SSM)
 To compare the original finite cache against the Mamba-style state-space memory on long streams:
 
-* **Run baseline TDA or SSM in `tda_runner.py`:**
+* **Run baseline TDA cache or SSM variants in `tda_runner.py`:**
 ```
 python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type cache
-python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm --ssm-correction-mode heuristic
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm --ssm-correction-mode kalman-fixed
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm --ssm-correction-mode kalman-adaptive
+```
+
+For fixed Kalman noise:
+```
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm --ssm-correction-mode kalman-fixed --kalman-q 0.01 --kalman-r 0.05
+```
+
+For adaptive Kalman noise ($Q$ from novelty, $R$ from confidence):
+```
+python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type ssm --ssm-correction-mode kalman-adaptive --kalman-q-min 0.005 --kalman-q-max 0.05 --kalman-r-min 0.01 --kalman-r-max 0.1
 ```
 
 On Apple Silicon, add `--device mps`:
@@ -93,6 +105,19 @@ python tda_runner.py --config configs --datasets I --backbone RN50 --memory-type
 ```
 bash ./scripts/run_stream_benchmark_rn50.sh
 bash ./scripts/run_stream_benchmark_vit.sh
+```
+
+The stream benchmark now runs all SSM correction variants by default:
+`heuristic`, `kalman-fixed`, and `kalman-adaptive`.
+
+If you want to keep cache code but run only SSM variants in experiments:
+```
+python stream_benchmark.py --config configs --datasets I --backbone RN50 --benchmark-mode ssm-only --ssm-correction-modes heuristic,kalman-fixed,kalman-adaptive
+```
+
+You can override this explicitly:
+```
+python stream_benchmark.py --config configs --datasets I --backbone RN50 --ssm-correction-modes heuristic,kalman-fixed,kalman-adaptive
 ```
 
 Or directly with explicit device:

@@ -71,6 +71,13 @@ class SSMemory:
         min_blend=0.02,
         max_blend=0.35,
         entropy_temp=4.0,
+        correction_mode='heuristic',
+        kalman_q=0.01,
+        kalman_r=0.05,
+        kalman_q_min=0.005,
+        kalman_q_max=0.05,
+        kalman_r_min=0.01,
+        kalman_r_max=0.1,
     ):
         self.num_classes = num_classes
         self.feature_dim = feature_dim
@@ -79,10 +86,31 @@ class SSMemory:
         self.min_blend = min_blend
         self.max_blend = max_blend
         self.entropy_temp = entropy_temp
+        self.correction_mode = correction_mode
+        self.kalman_q = kalman_q
+        self.kalman_r = kalman_r
+        self.kalman_q_min = kalman_q_min
+        self.kalman_q_max = kalman_q_max
+        self.kalman_r_min = kalman_r_min
+        self.kalman_r_max = kalman_r_max
+        self.eps = 1e-8
+
+        valid_modes = {'heuristic', 'kalman-fixed', 'kalman-adaptive', 'kalman-decoupled', 'vmf-fixed', 'vmf-adaptive', 'vmf-online'}
+        if self.correction_mode not in valid_modes:
+            raise ValueError(f'Unknown SSM correction mode: {self.correction_mode}')
+
+        if self.correction_mode == 'kalman-fixed':
+            self.correction_mode = 'vmf-fixed'
+        elif self.correction_mode == 'kalman-adaptive':
+            self.correction_mode = 'vmf-adaptive'
+        elif self.correction_mode == 'kalman-decoupled':
+            self.correction_mode = 'vmf-online'
 
         self.state_keys = torch.zeros(num_classes, feature_dim, dtype=torch.float32, device=device)
         self.seen = torch.zeros(num_classes, dtype=torch.bool, device=device)
+        self.state_cov = torch.zeros(num_classes, dtype=torch.float32, device=device)
         self.state_prob = torch.zeros(num_classes, num_classes, dtype=torch.float32, device=device) if include_prob_map else None
+        self.state_prob_cov = torch.zeros(num_classes, dtype=torch.float32, device=device) if include_prob_map else None
 
     def is_empty(self):
         return not bool(torch.any(self.seen).item())
@@ -101,24 +129,57 @@ class SSMemory:
         
         return self.min_blend + (self.max_blend - self.min_blend) * gate
 
-    def update(self, pred, feature, normalized_entropy, prob_map=None):
+    def _compute_confidence_novelty(self, normalized_entropy, sim):
+        confidence = min(1.0, max(0.0, 1.0 - float(normalized_entropy)))
+        novelty = min(1.0, max(0.0, 1.0 - float(sim)))
+        return confidence, novelty
+
+    def _vmf_concentrations(self, confidence, novelty):
+        if self.correction_mode == 'vmf-fixed':
+            q = self.kalman_q
+            r = self.kalman_r
+        else:
+            q = self.kalman_q_min + (self.kalman_q_max - self.kalman_q_min) * novelty
+            r = self.kalman_r_min + (self.kalman_r_max - self.kalman_r_min) * (1.0 - confidence)
+
+        # Map noise scales to directional precision (higher kappa = more trust).
+        kappa_prior = 1.0 / (q + self.eps)
+        kappa_obs = 1.0 / (r + self.eps)
+        return kappa_prior, kappa_obs
+
+    def _vmf_correct(self, prior_state, observation, confidence, novelty):
+        kappa_prior, kappa_obs = self._vmf_concentrations(confidence, novelty)
+
+        prior_dir = F.normalize(prior_state, dim=-1)
+        obs_dir = F.normalize(observation, dim=-1)
+        eta = kappa_prior * prior_dir + kappa_obs * obs_dir
+        post_dir = F.normalize(eta, dim=-1)
+        post_kappa = torch.norm(eta, dim=-1)
+
+        return post_dir, post_kappa, kappa_prior, kappa_obs
+
+    def update(self, pred, feature, normalized_entropy, prob_map=None, update_weight=1.0):
         with torch.no_grad():
             pred = int(pred)
             prev = self.state_keys[pred]
             obs = feature.squeeze(0).float()
+            update_weight = float(max(0.0, min(1.0, update_weight)))
 
             if not self.seen[pred]:
                 # First time seeing this class, initialize directly
-                self.state_keys[pred] = obs
+                self.state_keys[pred] = F.normalize(obs, dim=-1)
                 self.seen[pred] = True
+                self.state_cov[pred] = 1.0
                 if self.include_prob_map and prob_map is not None:
                     self.state_prob[pred] = prob_map.squeeze(0).float()
+                    self.state_prob_cov[pred] = 1.0
                 return
 
             # --- NOVELTY: Similarity-Aware Selective SSM ---
             # 1. Compute data-dependent step size (Delta) based on Mamba's selective mechanism.
             sim = F.cosine_similarity(prev.unsqueeze(0), obs.unsqueeze(0)).item()
-            delta_t = self._compute_delta(normalized_entropy, sim)
+            delta_t = self._compute_delta(normalized_entropy, sim) * update_weight
+            confidence, novelty = self._compute_confidence_novelty(normalized_entropy, sim)
             
             # 2. Discretization (Zero-order hold approximation of continuous SSM)
             # Continuous system: h'(t) = -lambda * h(t) + x(t)
@@ -128,15 +189,36 @@ class SSMemory:
             B_bar = delta_t
 
             # Update and normalize to prevent unbounded growth (crucial for TTA stability)
-            new_state = A_bar * prev + B_bar * obs
-            self.state_keys[pred] = F.normalize(new_state, dim=-1)
+            pred_state = A_bar * prev + B_bar * obs
+
+            if self.correction_mode == 'heuristic':
+                self.state_keys[pred] = F.normalize(pred_state, dim=-1)
+            else:
+                prior_state = A_bar * prev if self.correction_mode == 'vmf-online' else pred_state
+                corrected_state, corrected_kappa, kappa_prior, kappa_obs = self._vmf_correct(
+                    prior_state,
+                    obs,
+                    confidence,
+                    novelty,
+                )
+                self.state_keys[pred] = corrected_state
+                self.state_cov[pred] = corrected_kappa
 
             if self.include_prob_map and prob_map is not None:
                 prev_prob = self.state_prob[pred]
                 obs_prob = prob_map.squeeze(0).float()
-                new_prob = A_bar * prev_prob + B_bar * obs_prob
+                pred_prob = A_bar * prev_prob + B_bar * obs_prob
+
+                if self.correction_mode == 'heuristic':
+                    new_prob = pred_prob
+                else:
+                    prior_prob = A_bar * prev_prob if self.correction_mode == 'vmf-online' else pred_prob
+                    w_obs = kappa_obs / (kappa_prior + kappa_obs + self.eps)
+                    new_prob = (1.0 - w_obs) * prior_prob + w_obs * obs_prob
+                    self.state_prob_cov[pred] = kappa_prior + kappa_obs
+
                 # Normalize probabilities to sum to 1 to keep them within mask thresholds
-                self.state_prob[pred] = new_prob / new_prob.sum()
+                self.state_prob[pred] = new_prob / (new_prob.sum() + self.eps)
 
     def logits(self, image_features, alpha, beta, clip_weights, neg_mask_thresholds=None):
         if self.is_empty():
@@ -159,6 +241,8 @@ class SSMemory:
     def memory_bytes(self):
         total_bytes = self.state_keys.element_size() * self.state_keys.nelement()
         total_bytes += self.seen.element_size() * self.seen.nelement()
+        total_bytes += self.state_cov.element_size() * self.state_cov.nelement()
         if self.state_prob is not None:
             total_bytes += self.state_prob.element_size() * self.state_prob.nelement()
+            total_bytes += self.state_prob_cov.element_size() * self.state_prob_cov.nelement()
         return total_bytes

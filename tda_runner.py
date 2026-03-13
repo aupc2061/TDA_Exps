@@ -24,22 +24,49 @@ def get_arguments():
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
     parser.add_argument('--device', dest='device', type=str, choices=['auto', 'cuda', 'mps', 'cpu'], default='auto', help='Execution device. Default: auto')
     parser.add_argument('--memory-type', dest='memory_type', type=str, choices=['cache', 'ssm'], default='cache', help='Adapter memory backend: original finite cache or SSM memory. Default is cache.')
+    parser.add_argument('--ssm-correction-mode', dest='ssm_correction_mode', type=str, choices=['heuristic', 'kalman-fixed', 'kalman-adaptive', 'kalman-decoupled', 'vmf-fixed', 'vmf-adaptive', 'vmf-online'], default='heuristic', help='SSM state correction: heuristic, vMF-fixed, vMF-adaptive, vMF-online (Kalman names remain as aliases). Default: heuristic.')
+    parser.add_argument('--kalman-q', dest='kalman_q', type=float, default=0.01, help='Fixed Kalman process noise (Q) for --ssm-correction-mode kalman-fixed.')
+    parser.add_argument('--kalman-r', dest='kalman_r', type=float, default=0.05, help='Fixed Kalman observation noise (R) for --ssm-correction-mode kalman-fixed.')
+    parser.add_argument('--kalman-q-min', dest='kalman_q_min', type=float, default=0.005, help='Minimum adaptive Kalman process noise Q (low novelty).')
+    parser.add_argument('--kalman-q-max', dest='kalman_q_max', type=float, default=0.05, help='Maximum adaptive Kalman process noise Q (high novelty).')
+    parser.add_argument('--kalman-r-min', dest='kalman_r_min', type=float, default=0.01, help='Minimum adaptive Kalman observation noise R (high confidence).')
+    parser.add_argument('--kalman-r-max', dest='kalman_r_max', type=float, default=0.1, help='Maximum adaptive Kalman observation noise R (low confidence).')
     parser.add_argument('--max-samples', dest='max_samples', type=int, default=None, help='Optional maximum stream length per dataset.')
+    parser.add_argument('--n-views', dest='n_views', type=int, default=0, help='Number of augmented views for consensus gating (0=disabled).')
+    parser.add_argument('--top-k', dest='top_k', type=int, default=5, help='Top-K classes to keep per view in consensus gating.')
+    parser.add_argument('--consensus-threshold', dest='consensus_threshold', type=float, default=0.5, help='Fraction of views that must agree for consensus (0.0-1.0).')
+    parser.add_argument('--dynamic-view-budget', dest='dynamic_view_budget', action='store_true', help='Enable dynamic soft-consensus view scheduling with early stopping.')
+    parser.add_argument('--dynamic-max-views', dest='dynamic_max_views', type=int, default=8, help='Maximum total views to use in dynamic consensus, including the clean view.')
+    parser.add_argument('--dynamic-mid-views', dest='dynamic_mid_views', type=int, default=4, help='Intermediate total view budget for medium-confidence samples.')
+    parser.add_argument('--single-view-confidence', dest='single_view_confidence', type=float, default=0.80, help='Confidence score needed to stop after one view in dynamic consensus.')
+    parser.add_argument('--single-view-margin', dest='single_view_margin', type=float, default=0.35, help='Top-1 minus top-2 probability margin needed to stop after one view.')
+    parser.add_argument('--early-stop-score', dest='early_stop_score', type=float, default=0.60, help='Soft agreement score needed to stop early after the initial dynamic view budget.')
+    parser.add_argument('--early-stop-margin', dest='early_stop_margin', type=float, default=0.25, help='Probability margin needed to stop early after the initial dynamic view budget.')
 
     args = parser.parse_args()
 
     return args
 
 
-def _build_memory(backend, params, clip_weights, image_features, include_prob_map=False):
+def _build_memory(backend, params, clip_weights, image_features, include_prob_map=False, ssm_kwargs=None):
     if backend == 'cache':
         return CacheMemory(shot_capacity=params['shot_capacity'], include_prob_map=include_prob_map)
+
+    if ssm_kwargs is None:
+        ssm_kwargs = {}
 
     return SSMemory(
         num_classes=clip_weights.size(1),
         feature_dim=image_features.size(1),
         device=image_features.device,
         include_prob_map=include_prob_map,
+        correction_mode=ssm_kwargs['correction_mode'],
+        kalman_q=ssm_kwargs['kalman_q'],
+        kalman_r=ssm_kwargs['kalman_r'],
+        kalman_q_min=ssm_kwargs['kalman_q_min'],
+        kalman_q_max=ssm_kwargs['kalman_q_max'],
+        kalman_r_min=ssm_kwargs['kalman_r_min'],
+        kalman_r_max=ssm_kwargs['kalman_r_max'],
     )
 
 
@@ -100,13 +127,29 @@ def run_test_tda(
     enable_wandb=False,
     log_interval=1000,
     return_details=False,
+    ssm_kwargs=None,
+    consensus_kwargs=None,
 ):
     device = next(clip_model.parameters()).device
+    use_consensus = consensus_kwargs is not None and consensus_kwargs.get('n_views', 0) > 0
+    if use_consensus:
+        top_k = consensus_kwargs.get('top_k', 5)
+        consensus_threshold = consensus_kwargs.get('consensus_threshold', 0.5)
+        dynamic_view_budget = consensus_kwargs.get('dynamic_view_budget', False)
+        dynamic_kwargs = consensus_kwargs.get('dynamic_kwargs', {})
 
     with torch.no_grad():
         pos_memory, neg_memory, accuracies = None, None, []
         correct_history = []
         step_times = []
+        consensus_accept_count = 0
+        consensus_total_count = 0
+        soft_score_history = []
+        update_weight_history = []
+        accept_flag_history = []
+        views_used_history = []
+        view_savings_history = []
+        early_stop_count = 0
         if device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -127,19 +170,54 @@ def run_test_tda(
             _sync_device(device)
             step_start = time.perf_counter()
 
-            image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images ,clip_model, clip_weights, device=device)
+            if use_consensus:
+                if dynamic_view_budget:
+                    image_features, clip_logits, loss, prob_map, pred, consensus_stats = \
+                        dynamic_multiview_consensus_logits(images, clip_model, clip_weights,
+                                                           top_k=top_k,
+                                                           consensus_threshold=consensus_threshold,
+                                                           dynamic_kwargs=dynamic_kwargs,
+                                                           device=device)
+                else:
+                    image_features, clip_logits, loss, prob_map, pred, consensus_stats = \
+                        multiview_consensus_logits(images, clip_model, clip_weights,
+                                                  top_k=top_k,
+                                                  consensus_threshold=consensus_threshold,
+                                                  device=device)
+                consensus_total_count += 1
+                if consensus_stats['soft_accept']:
+                    consensus_accept_count += 1
+                soft_score_history.append(float(consensus_stats['soft_score']))
+                update_weight_history.append(float(consensus_stats['update_weight']))
+                accept_flag_history.append(1.0 if consensus_stats['soft_accept'] else 0.0)
+                views_used_history.append(float(consensus_stats.get('num_views_used', 1)))
+                view_savings_history.append(float(consensus_stats.get('view_savings', 0)))
+                if dynamic_view_budget and consensus_stats.get('stop_reason', '') != 'max_budget':
+                    early_stop_count += 1
+            else:
+                image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images, clip_model, clip_weights, device=device)
+                consensus_stats = None
+
             target, prop_entropy = target.to(device), get_entropy(loss, clip_weights)
 
             if pos_enabled and pos_memory is None:
-                pos_memory = _build_memory(memory_type, pos_params, clip_weights, image_features, include_prob_map=False)
+                pos_memory = _build_memory(memory_type, pos_params, clip_weights, image_features, include_prob_map=False, ssm_kwargs=ssm_kwargs)
             if neg_enabled and neg_memory is None:
-                neg_memory = _build_memory(memory_type, neg_params, clip_weights, image_features, include_prob_map=True)
+                neg_memory = _build_memory(memory_type, neg_params, clip_weights, image_features, include_prob_map=True, ssm_kwargs=ssm_kwargs)
+
+            update_weight = consensus_stats['update_weight'] if use_consensus else 1.0
 
             if pos_enabled:
-                pos_memory.update(pred, image_features, float(loss), prob_map=None) if memory_type == 'cache' else pos_memory.update(pred, image_features, prop_entropy, prob_map=None)
+                if memory_type == 'cache':
+                    pos_memory.update(pred, image_features, float(loss), prob_map=None)
+                else:
+                    pos_memory.update(pred, image_features, prop_entropy, prob_map=None, update_weight=update_weight)
 
             if neg_enabled and neg_params['entropy_threshold']['lower'] < prop_entropy < neg_params['entropy_threshold']['upper']:
-                neg_memory.update(pred, image_features, float(loss), prob_map=prob_map) if memory_type == 'cache' else neg_memory.update(pred, image_features, prop_entropy, prob_map=prob_map)
+                if memory_type == 'cache':
+                    neg_memory.update(pred, image_features, float(loss), prob_map=prob_map)
+                else:
+                    neg_memory.update(pred, image_features, prop_entropy, prob_map=prob_map, update_weight=update_weight)
 
             final_logits = clip_logits.clone()
             if pos_enabled and pos_memory is not None and not pos_memory.is_empty():
@@ -184,7 +262,7 @@ def run_test_tda(
             return avg_acc
 
         forgetting_metrics = _compute_forgetting_curves(correct_history)
-        return {
+        details = {
             'accuracy': avg_acc,
             'num_samples': len(accuracies),
             'cumulative_accuracy': forgetting_metrics['cumulative_accuracy'],
@@ -196,6 +274,27 @@ def run_test_tda(
             peak_mem_key: peak_device_mem / (1024.0 * 1024.0),
             'adapter_memory_mb': adapter_memory_bytes / (1024.0 * 1024.0),
         }
+        if use_consensus and consensus_total_count > 0:
+            details['consensus_accept_rate'] = consensus_accept_count / consensus_total_count
+            soft_score_prefix = np.cumsum(np.array(soft_score_history, dtype=np.float64))
+            update_weight_prefix = np.cumsum(np.array(update_weight_history, dtype=np.float64))
+            accept_prefix = np.cumsum(np.array(accept_flag_history, dtype=np.float64))
+            steps = np.arange(1, len(soft_score_history) + 1, dtype=np.float64)
+            details['avg_soft_score'] = float(soft_score_prefix[-1] / steps[-1])
+            details['avg_update_weight'] = float(update_weight_prefix[-1] / steps[-1])
+            details['soft_score_curve'] = (soft_score_prefix / steps).tolist()
+            details['update_weight_curve'] = (update_weight_prefix / steps).tolist()
+            details['consensus_accept_rate_curve'] = (accept_prefix / steps).tolist()
+            if len(views_used_history) > 0:
+                views_used_prefix = np.cumsum(np.array(views_used_history, dtype=np.float64))
+                view_savings_prefix = np.cumsum(np.array(view_savings_history, dtype=np.float64))
+                details['avg_views_used'] = float(views_used_prefix[-1] / steps[-1])
+                details['avg_view_savings'] = float(view_savings_prefix[-1] / steps[-1])
+                details['avg_views_used_curve'] = (views_used_prefix / steps).tolist()
+                details['avg_view_savings_curve'] = (view_savings_prefix / steps).tolist()
+                if dynamic_view_budget:
+                    details['early_stop_rate'] = early_stop_count / consensus_total_count
+        return details
 
 
 
@@ -223,6 +322,37 @@ def main():
     if args.wandb:
         date = datetime.now().strftime("%b%d_%H-%M-%S")
         group_name = f"{args.backbone}_{args.datasets}_{date}"
+
+    ssm_kwargs = {
+        'correction_mode': args.ssm_correction_mode,
+        'kalman_q': args.kalman_q,
+        'kalman_r': args.kalman_r,
+        'kalman_q_min': args.kalman_q_min,
+        'kalman_q_max': args.kalman_q_max,
+        'kalman_r_min': args.kalman_r_min,
+        'kalman_r_max': args.kalman_r_max,
+    }
+
+    consensus_kwargs = None
+    if args.n_views > 0:
+        dynamic_max_aug_views = args.n_views
+        if args.dynamic_view_budget:
+            dynamic_max_aug_views = min(args.n_views, max(0, args.dynamic_max_views - 1))
+        consensus_kwargs = {
+            'n_views': dynamic_max_aug_views,
+            'top_k': args.top_k,
+            'consensus_threshold': args.consensus_threshold,
+            'dynamic_view_budget': args.dynamic_view_budget,
+            'dynamic_kwargs': {
+                'max_views': max(1, args.dynamic_max_views),
+                'min_views': 2,
+                'mid_views': max(2, args.dynamic_mid_views),
+                'single_view_confidence': args.single_view_confidence,
+                'single_view_margin': args.single_view_margin,
+                'early_stop_score': args.early_stop_score,
+                'early_stop_margin': args.early_stop_margin,
+            },
+        }
     
     # Run TDA on each dataset
     datasets = args.datasets.split('/')
@@ -233,7 +363,9 @@ def main():
         print("\nRunning dataset configurations:")
         print(cfg, "\n")
         
-        test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
+        test_loader, classnames, template = build_test_data_loader(
+            dataset_name, args.data_root, preprocess,
+            n_views=consensus_kwargs['n_views'] if consensus_kwargs is not None else args.n_views)
         clip_weights = clip_classifier(classnames, template, clip_model, device=device)
 
         if args.wandb:
@@ -249,6 +381,8 @@ def main():
             memory_type=args.memory_type,
             max_samples=args.max_samples,
             enable_wandb=args.wandb,
+            ssm_kwargs=ssm_kwargs,
+            consensus_kwargs=consensus_kwargs,
         )
 
         if args.wandb:
