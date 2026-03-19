@@ -9,7 +9,7 @@ import torch
 
 import clip
 from utils import *
-from memory import CacheMemory, SSMemory
+from memory import AnchorReservoir, CacheMemory, SSMemory
 
 wandb = None
 
@@ -42,6 +42,11 @@ def get_arguments():
     parser.add_argument('--single-view-margin', dest='single_view_margin', type=float, default=0.35, help='Top-1 minus top-2 probability margin needed to stop after one view.')
     parser.add_argument('--early-stop-score', dest='early_stop_score', type=float, default=0.60, help='Soft agreement score needed to stop early after the initial dynamic view budget.')
     parser.add_argument('--early-stop-margin', dest='early_stop_margin', type=float, default=0.25, help='Probability margin needed to stop early after the initial dynamic view budget.')
+    parser.add_argument('--enable-anchor-reservoir', dest='enable_anchor_reservoir', action='store_true', help='Enable ViT-only domain anchor reservoir and anchor-based logit correction.')
+    parser.add_argument('--anchor-reservoir-size', dest='anchor_reservoir_size', type=int, default=4, help='Per-class capacity for the anchor reservoir.')
+    parser.add_argument('--anchor-entropy-threshold', dest='anchor_entropy_threshold', type=float, default=0.25, help='Maximum normalized entropy for adding a sample to the anchor reservoir.')
+    parser.add_argument('--anchor-alpha', dest='anchor_alpha', type=float, default=0.6, help='Strength of anchor-based logit correction.')
+    parser.add_argument('--anchor-beta', dest='anchor_beta', type=float, default=1.5, help='Layer weighting temperature for anchor-based logit correction.')
 
     args = parser.parse_args()
 
@@ -129,6 +134,7 @@ def run_test_tda(
     return_details=False,
     ssm_kwargs=None,
     consensus_kwargs=None,
+    anchor_kwargs=None,
 ):
     device = next(clip_model.parameters()).device
     use_consensus = consensus_kwargs is not None and consensus_kwargs.get('n_views', 0) > 0
@@ -140,6 +146,7 @@ def run_test_tda(
 
     with torch.no_grad():
         pos_memory, neg_memory, accuracies = None, None, []
+        anchor_memory = None
         correct_history = []
         step_times = []
         consensus_accept_count = 0
@@ -157,6 +164,7 @@ def run_test_tda(
         
         #Unpack all hyperparameters
         pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
+        anchor_enabled = anchor_kwargs is not None and anchor_kwargs.get('enabled', False)
         if pos_enabled:
             pos_params = {k: pos_cfg[k] for k in ['shot_capacity', 'alpha', 'beta']}
         if neg_enabled:
@@ -178,12 +186,14 @@ def run_test_tda(
                                                            consensus_threshold=consensus_threshold,
                                                            dynamic_kwargs=dynamic_kwargs,
                                                            device=device)
+                    visual_details = {'layer_cls_tokens': None, 'supports_anchor': False}
                 else:
                     image_features, clip_logits, loss, prob_map, pred, consensus_stats = \
                         multiview_consensus_logits(images, clip_model, clip_weights,
                                                   top_k=top_k,
                                                   consensus_threshold=consensus_threshold,
                                                   device=device)
+                    visual_details = {'layer_cls_tokens': None, 'supports_anchor': False}
                 consensus_total_count += 1
                 if consensus_stats['soft_accept']:
                     consensus_accept_count += 1
@@ -195,7 +205,13 @@ def run_test_tda(
                 if dynamic_view_budget and consensus_stats.get('stop_reason', '') != 'max_budget':
                     early_stop_count += 1
             else:
-                image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images, clip_model, clip_weights, device=device)
+                image_features, clip_logits, loss, prob_map, pred, visual_details = get_clip_logits_with_details(
+                    images,
+                    clip_model,
+                    clip_weights,
+                    device=device,
+                    return_layer_cls=anchor_enabled,
+                )
                 consensus_stats = None
 
             target, prop_entropy = target.to(device), get_entropy(loss, clip_weights)
@@ -204,6 +220,13 @@ def run_test_tda(
                 pos_memory = _build_memory(memory_type, pos_params, clip_weights, image_features, include_prob_map=False, ssm_kwargs=ssm_kwargs)
             if neg_enabled and neg_memory is None:
                 neg_memory = _build_memory(memory_type, neg_params, clip_weights, image_features, include_prob_map=True, ssm_kwargs=ssm_kwargs)
+            if anchor_enabled and anchor_memory is None and visual_details.get('supports_anchor', False):
+                anchor_memory = AnchorReservoir(
+                    num_classes=clip_weights.size(1),
+                    capacity=anchor_kwargs['capacity'],
+                    device=device,
+                    entropy_threshold=anchor_kwargs['entropy_threshold'],
+                )
 
             update_weight = consensus_stats['update_weight'] if use_consensus else 1.0
 
@@ -219,6 +242,14 @@ def run_test_tda(
                 else:
                     neg_memory.update(pred, image_features, prop_entropy, prob_map=prob_map, update_weight=update_weight)
 
+            if anchor_memory is not None:
+                anchor_memory.update(
+                    pred,
+                    visual_details.get('layer_cls_tokens'),
+                    prop_entropy,
+                    update_weight=update_weight,
+                )
+
             final_logits = clip_logits.clone()
             if pos_enabled and pos_memory is not None and not pos_memory.is_empty():
                 final_logits += pos_memory.logits(image_features, pos_params['alpha'], pos_params['beta'], clip_weights)
@@ -230,6 +261,12 @@ def run_test_tda(
                     clip_weights,
                     (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper'])
                 )
+            if anchor_memory is not None and not anchor_memory.is_empty():
+                final_logits += anchor_memory.logits(
+                    visual_details.get('layer_cls_tokens'),
+                    anchor_kwargs['alpha'],
+                    anchor_kwargs['beta'],
+                ).to(final_logits.dtype)
 
                 
             acc = cls_acc(final_logits, target)  
@@ -254,6 +291,8 @@ def run_test_tda(
             adapter_memory_bytes += pos_memory.memory_bytes()
         if neg_memory is not None:
             adapter_memory_bytes += neg_memory.memory_bytes()
+        if anchor_memory is not None:
+            adapter_memory_bytes += anchor_memory.memory_bytes()
 
         avg_acc = sum(accuracies)/len(accuracies) if len(accuracies) > 0 else 0.0
         print("---- TDA's test accuracy: {:.2f}. ----\n".format(avg_acc))
@@ -332,6 +371,13 @@ def main():
         'kalman_r_min': args.kalman_r_min,
         'kalman_r_max': args.kalman_r_max,
     }
+    anchor_kwargs = {
+        'enabled': args.enable_anchor_reservoir,
+        'capacity': args.anchor_reservoir_size,
+        'entropy_threshold': args.anchor_entropy_threshold,
+        'alpha': args.anchor_alpha,
+        'beta': args.anchor_beta,
+    }
 
     consensus_kwargs = None
     if args.n_views > 0:
@@ -383,6 +429,7 @@ def main():
             enable_wandb=args.wandb,
             ssm_kwargs=ssm_kwargs,
             consensus_kwargs=consensus_kwargs,
+            anchor_kwargs=anchor_kwargs,
         )
 
         if args.wandb:

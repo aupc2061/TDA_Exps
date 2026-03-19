@@ -246,3 +246,70 @@ class SSMemory:
             total_bytes += self.state_prob.element_size() * self.state_prob.nelement()
             total_bytes += self.state_prob_cov.element_size() * self.state_prob_cov.nelement()
         return total_bytes
+
+
+class AnchorReservoir:
+    def __init__(self, num_classes, capacity, device, entropy_threshold=0.25):
+        self.num_classes = num_classes
+        self.capacity = capacity
+        self.device = device
+        self.entropy_threshold = entropy_threshold
+        self.reservoir = {class_idx: [] for class_idx in range(num_classes)}
+
+    def is_empty(self):
+        return all(len(items) == 0 for items in self.reservoir.values())
+
+    def update(self, pred, layer_cls_tokens, normalized_entropy, update_weight=1.0):
+        if layer_cls_tokens is None or self.capacity <= 0:
+            return
+
+        normalized_entropy = float(normalized_entropy)
+        update_weight = float(max(0.0, min(1.0, update_weight)))
+        if normalized_entropy > self.entropy_threshold or update_weight <= 0.0:
+            return
+
+        pred = int(pred)
+        tokens = F.normalize(layer_cls_tokens.squeeze(0).detach().float(), dim=-1)
+        effective_entropy = normalized_entropy / max(update_weight, 1e-6)
+        item = [tokens, effective_entropy]
+
+        class_items = self.reservoir[pred]
+        class_items.append(item)
+        class_items.sort(key=operator.itemgetter(1))
+        if len(class_items) > self.capacity:
+            del class_items[self.capacity:]
+
+    def logits(self, layer_cls_tokens, alpha, beta):
+        if layer_cls_tokens is None or self.is_empty():
+            return torch.zeros(1, self.num_classes, device=self.device, dtype=torch.float32)
+
+        query = F.normalize(layer_cls_tokens.squeeze(0).float(), dim=-1)
+        layer_count = query.size(0)
+        layer_positions = torch.arange(1, layer_count + 1, device=query.device, dtype=query.dtype)
+        layer_weights = torch.exp(beta * layer_positions / float(layer_count))
+        layer_weights = layer_weights / layer_weights.sum().clamp_min(1e-6)
+
+        class_scores = torch.zeros(self.num_classes, device=query.device, dtype=query.dtype)
+        for class_idx, items in self.reservoir.items():
+            if len(items) == 0:
+                continue
+
+            best_score = None
+            for tokens, _ in items:
+                anchor = F.normalize(tokens.to(query.device, dtype=query.dtype), dim=-1)
+                per_layer_sim = (query * anchor).sum(dim=-1)
+                score = torch.sum(layer_weights * per_layer_sim)
+                if best_score is None or score > best_score:
+                    best_score = score
+
+            class_scores[class_idx] = best_score
+
+        return alpha * class_scores.unsqueeze(0)
+
+    def memory_bytes(self):
+        total_bytes = 0
+        for class_items in self.reservoir.values():
+            for item in class_items:
+                tokens = item[0]
+                total_bytes += tokens.element_size() * tokens.nelement()
+        return total_bytes

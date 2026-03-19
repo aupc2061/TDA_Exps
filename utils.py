@@ -127,6 +127,54 @@ def get_clip_logits(images, clip_model, clip_weights, device=None):
         return image_features, clip_logits, loss, prob_map, pred
 
 
+def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, return_layer_cls=False):
+    if device is None:
+        device = next(clip_model.parameters()).device
+
+    with torch.no_grad():
+        if isinstance(images, list):
+            images = torch.cat(images, dim=0).to(device)
+        else:
+            images = images.to(device)
+
+        model_outputs = clip_model.encode_image(images, return_layer_cls=return_layer_cls)
+        if isinstance(model_outputs, dict):
+            raw_image_features = model_outputs["image_features"]
+            layer_cls_tokens = model_outputs.get("layer_cls_tokens")
+        else:
+            raw_image_features = model_outputs
+            layer_cls_tokens = None
+
+        image_features = raw_image_features / raw_image_features.norm(dim=-1, keepdim=True)
+        clip_logits = 100. * image_features @ clip_weights
+
+        if image_features.size(0) > 1:
+            batch_entropy = softmax_entropy(clip_logits)
+            selected_idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * 0.1)]
+            output = clip_logits[selected_idx]
+            image_features = image_features[selected_idx].mean(0).unsqueeze(0)
+            clip_logits = output.mean(0).unsqueeze(0)
+            selected_layer_cls = None if layer_cls_tokens is None else layer_cls_tokens[selected_idx]
+            if selected_layer_cls is not None:
+                selected_layer_cls = selected_layer_cls.mean(dim=0, keepdim=True)
+
+            loss = avg_entropy(output)
+            prob_map = output.softmax(1).mean(0).unsqueeze(0)
+            pred = int(output.mean(0).unsqueeze(0).topk(1, 1, True, True)[1].t())
+        else:
+            selected_layer_cls = layer_cls_tokens
+            loss = softmax_entropy(clip_logits)
+            prob_map = clip_logits.softmax(1)
+            pred = int(clip_logits.topk(1, 1, True, True)[1].t()[0])
+
+        details = {
+            'layer_cls_tokens': selected_layer_cls,
+            'supports_anchor': selected_layer_cls is not None,
+        }
+
+        return image_features, clip_logits, loss, prob_map, pred, details
+
+
 def get_ood_preprocess():
     normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                 std=[0.26862954, 0.26130258, 0.27577711])

@@ -216,7 +216,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_layer_cls: bool = False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -225,13 +225,29 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        if return_layer_cls:
+            layer_cls_tokens = []
+            for block in self.transformer.resblocks:
+                x = block(x)
+                layer_cls = x[0]
+                layer_cls = self.ln_post(layer_cls)
+                if self.proj is not None:
+                    layer_cls = layer_cls @ self.proj
+                layer_cls_tokens.append(layer_cls)
+        else:
+            x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
             x = x @ self.proj
+
+        if return_layer_cls:
+            return {
+                "image_features": x,
+                "layer_cls_tokens": torch.stack(layer_cls_tokens, dim=1),
+            }
 
         return x
 
@@ -333,8 +349,11 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, return_layer_cls: bool = False):
+        image = image.type(self.dtype)
+        if return_layer_cls and isinstance(self.visual, VisionTransformer):
+            return self.visual(image, return_layer_cls=True)
+        return self.visual(image)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
