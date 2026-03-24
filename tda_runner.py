@@ -181,6 +181,7 @@ def run_test_tda(
         anchor_accept_flag_history = []
         anchor_correction_active_history = []
         anchor_correction_norm_history = []
+        anchor_correction_skip_count = 0
         if device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -293,12 +294,16 @@ def run_test_tda(
                 )
             anchor_correction = None
             if anchor_memory is not None and not anchor_memory.is_empty():
-                anchor_correction = anchor_memory.logits(
+                proposed_anchor_correction = anchor_memory.logits(
                     visual_details.get('layer_cls_tokens'),
                     anchor_kwargs['alpha'],
                     anchor_kwargs['beta'],
                 ).to(final_logits.dtype)
-                final_logits += anchor_correction
+                if torch.isfinite(proposed_anchor_correction).all():
+                    anchor_correction = proposed_anchor_correction
+                    final_logits += anchor_correction
+                else:
+                    anchor_correction_skip_count += 1
 
             anchor_correction_active_history.append(1.0 if anchor_correction is not None else 0.0)
             anchor_correction_norm_history.append(
@@ -376,6 +381,10 @@ def run_test_tda(
             details['anchor_update_attempt_count'] = anchor_stats['total_update_attempts']
             details['anchor_update_accept_rate'] = anchor_stats['accept_rate']
             details['anchor_fill_ratio'] = anchor_stats['fill_ratio']
+            details['anchor_invalid_update_rejections'] = anchor_stats['invalid_update_rejections']
+            details['anchor_invalid_query_rejections'] = anchor_stats['invalid_query_rejections']
+            details['anchor_invalid_anchor_rejections'] = anchor_stats['invalid_anchor_rejections']
+            details['anchor_correction_skip_count'] = anchor_correction_skip_count
             if len(anchor_fill_ratio_history) > 0:
                 anchor_fill_prefix = np.cumsum(np.array(anchor_fill_ratio_history, dtype=np.float64))
                 anchor_accept_prefix = np.cumsum(np.array(anchor_accept_flag_history, dtype=np.float64))

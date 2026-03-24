@@ -503,6 +503,12 @@ class AnchorReservoir:
         self.total_updates_seen = 0
         self.accepted_updates = 0
         self.last_update_accepted = False
+        self.invalid_update_rejections = 0
+        self.invalid_query_rejections = 0
+        self.invalid_anchor_rejections = 0
+
+    def _is_finite_tensor(self, tensor):
+        return tensor is not None and bool(torch.isfinite(tensor).all().item())
 
     def is_empty(self):
         return all(len(items) == 0 for items in self.reservoir.values())
@@ -512,6 +518,9 @@ class AnchorReservoir:
         self.last_update_accepted = False
         if layer_cls_tokens is None or self.capacity <= 0:
             return False
+        if not self._is_finite_tensor(layer_cls_tokens):
+            self.invalid_update_rejections += 1
+            return False
 
         normalized_entropy = float(normalized_entropy)
         update_weight = float(max(0.0, min(1.0, update_weight)))
@@ -519,7 +528,11 @@ class AnchorReservoir:
             return False
 
         pred = int(pred)
-        tokens = F.normalize(layer_cls_tokens.squeeze(0).detach().float(), dim=-1)
+        tokens = torch.nan_to_num(layer_cls_tokens.squeeze(0).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        tokens = F.normalize(tokens, dim=-1)
+        if not self._is_finite_tensor(tokens):
+            self.invalid_update_rejections += 1
+            return False
         effective_entropy = normalized_entropy / max(update_weight, 1e-6)
         item = [tokens, effective_entropy]
 
@@ -535,8 +548,15 @@ class AnchorReservoir:
     def logits(self, layer_cls_tokens, alpha, beta):
         if layer_cls_tokens is None or self.is_empty():
             return torch.zeros(1, self.num_classes, device=self.device, dtype=torch.float32)
+        if not self._is_finite_tensor(layer_cls_tokens):
+            self.invalid_query_rejections += 1
+            return torch.zeros(1, self.num_classes, device=self.device, dtype=torch.float32)
 
-        query = F.normalize(layer_cls_tokens.squeeze(0).float(), dim=-1)
+        query = torch.nan_to_num(layer_cls_tokens.squeeze(0).float(), nan=0.0, posinf=0.0, neginf=0.0)
+        query = F.normalize(query, dim=-1)
+        if not self._is_finite_tensor(query):
+            self.invalid_query_rejections += 1
+            return torch.zeros(1, self.num_classes, device=self.device, dtype=torch.float32)
         layer_count = query.size(0)
         layer_positions = torch.arange(1, layer_count + 1, device=query.device, dtype=query.dtype)
         layer_weights = torch.exp(beta * layer_positions / float(layer_count))
@@ -549,13 +569,21 @@ class AnchorReservoir:
 
             best_score = None
             for tokens, _ in items:
-                anchor = F.normalize(tokens.to(query.device, dtype=query.dtype), dim=-1)
+                anchor = torch.nan_to_num(tokens.to(query.device, dtype=query.dtype), nan=0.0, posinf=0.0, neginf=0.0)
+                anchor = F.normalize(anchor, dim=-1)
+                if not self._is_finite_tensor(anchor):
+                    self.invalid_anchor_rejections += 1
+                    continue
                 per_layer_sim = (query * anchor).sum(dim=-1)
                 score = torch.sum(layer_weights * per_layer_sim)
+                if not torch.isfinite(score):
+                    self.invalid_anchor_rejections += 1
+                    continue
                 if best_score is None or score > best_score:
                     best_score = score
 
-            class_scores[class_idx] = best_score
+            if best_score is not None:
+                class_scores[class_idx] = best_score
 
         return alpha * class_scores.unsqueeze(0)
 
@@ -571,6 +599,9 @@ class AnchorReservoir:
             'total_update_attempts': int(self.total_updates_seen),
             'accept_rate': float(self.accepted_updates / self.total_updates_seen) if self.total_updates_seen > 0 else 0.0,
             'fill_ratio': self.fill_ratio(),
+            'invalid_update_rejections': int(self.invalid_update_rejections),
+            'invalid_query_rejections': int(self.invalid_query_rejections),
+            'invalid_anchor_rejections': int(self.invalid_anchor_rejections),
         }
 
     def memory_bytes(self):

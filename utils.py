@@ -224,18 +224,26 @@ def _distribution_margin(probs):
     return float((top2[:, 0] - top2[:, 1]).mean().item())
 
 
+def _safe_normalize(x, dim=-1, eps=1e-6):
+    x = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    denom = x.norm(dim=dim, keepdim=True)
+    denom = torch.nan_to_num(denom, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(eps)
+    return x / denom
+
+
 def _encode_views(view_tensors, clip_model, clip_weights, device, return_layer_cls=False):
     image_batch = torch.cat(view_tensors, dim=0).to(device)
     model_outputs = clip_model.encode_image(image_batch, return_layer_cls=return_layer_cls)
     if isinstance(model_outputs, dict):
         raw_features = model_outputs["image_features"]
         layer_cls_tokens = model_outputs.get("layer_cls_tokens")
+        if layer_cls_tokens is not None:
+            layer_cls_tokens = torch.nan_to_num(layer_cls_tokens.float(), nan=0.0, posinf=0.0, neginf=0.0)
     else:
         raw_features = model_outputs
         layer_cls_tokens = None
 
-    features = raw_features
-    features = features / features.norm(dim=-1, keepdim=True)
+    features = _safe_normalize(raw_features, dim=-1)
     logits = 100.0 * features @ clip_weights
     return features, logits, layer_cls_tokens
 
@@ -264,11 +272,19 @@ def _compute_soft_consensus_outputs(all_features, all_logits, clip_weights, top_
     view_weight_temperature = 0.10
     view_weights = torch.softmax(-per_view_kl / view_weight_temperature, dim=0)
     denoised_feature = (view_weights.unsqueeze(1) * all_features).sum(dim=0, keepdim=True)
-    denoised_feature = denoised_feature / denoised_feature.norm(dim=-1, keepdim=True)
+    denoised_feature = _safe_normalize(denoised_feature, dim=-1)
     denoised_layer_cls = None
     if all_layer_cls_tokens is not None:
-        denoised_layer_cls = (view_weights.view(-1, 1, 1) * all_layer_cls_tokens).sum(dim=0, keepdim=True)
-        denoised_layer_cls = denoised_layer_cls / denoised_layer_cls.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        weighted_cls = view_weights.view(-1, 1, 1).float() * torch.nan_to_num(
+            all_layer_cls_tokens.float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        denoised_layer_cls = weighted_cls.sum(dim=0, keepdim=True)
+        denoised_layer_cls = _safe_normalize(denoised_layer_cls, dim=-1)
+        supports_anchor = bool(torch.isfinite(denoised_layer_cls).all().item())
+        if not supports_anchor:
+            denoised_layer_cls = None
+    else:
+        supports_anchor = False
     pred = int(mean_prob.argmax(dim=1).item())
 
     denoised_logits = 100.0 * denoised_feature @ clip_weights
@@ -287,7 +303,7 @@ def _compute_soft_consensus_outputs(all_features, all_logits, clip_weights, top_
 
     details = {
         'layer_cls_tokens': denoised_layer_cls,
-        'supports_anchor': denoised_layer_cls is not None,
+        'supports_anchor': supports_anchor if all_layer_cls_tokens is not None else False,
     }
 
     return denoised_feature, denoised_logits, loss, prob_map, pred, stats, details

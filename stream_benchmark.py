@@ -328,6 +328,10 @@ def run_head_to_head(args):
                                             'avg_anchor_fill_ratio',
                                             'avg_anchor_correction_active_rate',
                                             'avg_anchor_correction_norm',
+                                            'anchor_invalid_update_rejections',
+                                            'anchor_invalid_query_rejections',
+                                            'anchor_invalid_anchor_rejections',
+                                            'anchor_correction_skip_count',
                                         ]:
                                             if key in anchor_result:
                                                 row[key] = anchor_result[key]
@@ -625,6 +629,10 @@ def run_head_to_head(args):
                                     'avg_anchor_fill_ratio',
                                     'avg_anchor_correction_active_rate',
                                     'avg_anchor_correction_norm',
+                                    'anchor_invalid_update_rejections',
+                                    'anchor_invalid_query_rejections',
+                                    'anchor_invalid_anchor_rejections',
+                                    'anchor_correction_skip_count',
                                 ]:
                                     if key in result:
                                         row[key] = result[key]
