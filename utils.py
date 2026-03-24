@@ -224,16 +224,24 @@ def _distribution_margin(probs):
     return float((top2[:, 0] - top2[:, 1]).mean().item())
 
 
-def _encode_views(view_tensors, clip_model, clip_weights, device):
+def _encode_views(view_tensors, clip_model, clip_weights, device, return_layer_cls=False):
     image_batch = torch.cat(view_tensors, dim=0).to(device)
-    features = clip_model.encode_image(image_batch)
+    model_outputs = clip_model.encode_image(image_batch, return_layer_cls=return_layer_cls)
+    if isinstance(model_outputs, dict):
+        raw_features = model_outputs["image_features"]
+        layer_cls_tokens = model_outputs.get("layer_cls_tokens")
+    else:
+        raw_features = model_outputs
+        layer_cls_tokens = None
+
+    features = raw_features
     features = features / features.norm(dim=-1, keepdim=True)
     logits = 100.0 * features @ clip_weights
-    return features, logits
+    return features, logits, layer_cls_tokens
 
 
 def _compute_soft_consensus_outputs(all_features, all_logits, clip_weights, top_k,
-                                    consensus_threshold, device):
+                                    consensus_threshold, device, all_layer_cls_tokens=None):
     masked_logits = _apply_top_k_mask(all_logits, top_k)
     masked_probs = masked_logits.softmax(dim=1)
     mean_prob = masked_probs.mean(dim=0, keepdim=True)
@@ -257,6 +265,10 @@ def _compute_soft_consensus_outputs(all_features, all_logits, clip_weights, top_
     view_weights = torch.softmax(-per_view_kl / view_weight_temperature, dim=0)
     denoised_feature = (view_weights.unsqueeze(1) * all_features).sum(dim=0, keepdim=True)
     denoised_feature = denoised_feature / denoised_feature.norm(dim=-1, keepdim=True)
+    denoised_layer_cls = None
+    if all_layer_cls_tokens is not None:
+        denoised_layer_cls = (view_weights.view(-1, 1, 1) * all_layer_cls_tokens).sum(dim=0, keepdim=True)
+        denoised_layer_cls = denoised_layer_cls / denoised_layer_cls.norm(dim=-1, keepdim=True).clamp_min(1e-6)
     pred = int(mean_prob.argmax(dim=1).item())
 
     denoised_logits = 100.0 * denoised_feature @ clip_weights
@@ -273,12 +285,17 @@ def _compute_soft_consensus_outputs(all_features, all_logits, clip_weights, top_
         'num_views_used': int(all_features.size(0)),
     }
 
-    return denoised_feature, denoised_logits, loss, prob_map, pred, stats
+    details = {
+        'layer_cls_tokens': denoised_layer_cls,
+        'supports_anchor': denoised_layer_cls is not None,
+    }
+
+    return denoised_feature, denoised_logits, loss, prob_map, pred, stats, details
 
 
 def dynamic_multiview_consensus_logits(images, clip_model, clip_weights, top_k=5,
                                        consensus_threshold=0.5, dynamic_kwargs=None,
-                                       device=None):
+                                       device=None, return_layer_cls=False):
     if device is None:
         device = next(clip_model.parameters()).device
 
@@ -290,6 +307,7 @@ def dynamic_multiview_consensus_logits(images, clip_model, clip_weights, top_k=5
             top_k=top_k,
             consensus_threshold=consensus_threshold,
             device=device,
+            return_layer_cls=return_layer_cls,
         )
 
     dynamic_kwargs = dynamic_kwargs or {}
@@ -310,6 +328,7 @@ def dynamic_multiview_consensus_logits(images, clip_model, clip_weights, top_k=5
 
     encoded_features = []
     encoded_logits = []
+    encoded_layer_cls = []
     views_used = 0
 
     def _extend_to(target_budget):
@@ -318,18 +337,28 @@ def dynamic_multiview_consensus_logits(images, clip_model, clip_weights, top_k=5
         if target_budget <= views_used:
             all_features = torch.cat(encoded_features, dim=0)
             all_logits = torch.cat(encoded_logits, dim=0)
+            all_layer_cls = None if len(encoded_layer_cls) == 0 else torch.cat(encoded_layer_cls, dim=0)
             return _compute_soft_consensus_outputs(
-                all_features, all_logits, clip_weights, top_k, consensus_threshold, device
+                all_features, all_logits, clip_weights, top_k, consensus_threshold, device, all_layer_cls_tokens=all_layer_cls
             )
 
-        new_features, new_logits = _encode_views(images[views_used:target_budget], clip_model, clip_weights, device)
+        new_features, new_logits, new_layer_cls = _encode_views(
+            images[views_used:target_budget],
+            clip_model,
+            clip_weights,
+            device,
+            return_layer_cls=return_layer_cls,
+        )
         encoded_features.append(new_features)
         encoded_logits.append(new_logits)
+        if new_layer_cls is not None:
+            encoded_layer_cls.append(new_layer_cls)
         views_used = target_budget
         all_features = torch.cat(encoded_features, dim=0)
         all_logits = torch.cat(encoded_logits, dim=0)
+        all_layer_cls = None if len(encoded_layer_cls) == 0 else torch.cat(encoded_layer_cls, dim=0)
         return _compute_soft_consensus_outputs(
-            all_features, all_logits, clip_weights, top_k, consensus_threshold, device
+            all_features, all_logits, clip_weights, top_k, consensus_threshold, device, all_layer_cls_tokens=all_layer_cls
         )
 
     result = _extend_to(1)
@@ -374,7 +403,7 @@ def dynamic_multiview_consensus_logits(images, clip_model, clip_weights, top_k=5
 
 
 def multiview_consensus_logits(images, clip_model, clip_weights, top_k=5,
-                               consensus_threshold=0.5, device=None):
+                               consensus_threshold=0.5, device=None, return_layer_cls=False):
     """
     Process multiple augmented views with top-K masking and consensus gating.
 
@@ -398,9 +427,13 @@ def multiview_consensus_logits(images, clip_model, clip_weights, top_k=5,
 
     with torch.no_grad():
         if isinstance(images, list):
-            all_features, all_logits = _encode_views(images, clip_model, clip_weights, device)
+            all_features, all_logits, all_layer_cls = _encode_views(
+                images, clip_model, clip_weights, device, return_layer_cls=return_layer_cls
+            )
         else:
-            all_features, all_logits = _encode_views([images], clip_model, clip_weights, device)
+            all_features, all_logits, all_layer_cls = _encode_views(
+                [images], clip_model, clip_weights, device, return_layer_cls=return_layer_cls
+            )
 
         return _compute_soft_consensus_outputs(
             all_features,
@@ -409,6 +442,7 @@ def multiview_consensus_logits(images, clip_model, clip_weights, top_k=5,
             top_k,
             consensus_threshold,
             device,
+            all_layer_cls_tokens=all_layer_cls,
         )
 
 

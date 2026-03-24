@@ -100,6 +100,15 @@ def run_head_to_head(args):
     ssm_modes = parse_str_list(args.ssm_correction_modes)
     run_cache = args.benchmark_mode in ['both', 'cache-only']
     run_ssm = args.benchmark_mode in ['both', 'ssm-only']
+    anchor_modes = parse_str_list(args.anchor_modes)
+    anchor_reservoir_sizes = parse_int_list(args.anchor_reservoir_sizes)
+    anchor_alphas = [float(x) for x in args.anchor_alphas.split(',') if x.strip()]
+    anchor_betas = [float(x) for x in args.anchor_betas.split(',') if x.strip()]
+    anchor_entropy_thresholds = [float(x) for x in args.anchor_entropy_thresholds.split(',') if x.strip()]
+    mamba3_modes = parse_str_list(args.mamba3_modes)
+    mamba3_phase_strengths = [float(x) for x in args.mamba3_phase_strengths.split(',') if x.strip()]
+    mamba3_num_slots = parse_int_list(args.mamba3_num_slots)
+    mamba3_new_slot_thresholds = [float(x) for x in args.mamba3_new_slot_thresholds.split(',') if x.strip()]
 
     # Consensus gating configs
     consensus_n_views = parse_int_list(args.n_views) if args.n_views.strip() else []
@@ -178,64 +187,325 @@ def run_head_to_head(args):
 
             if run_ssm:
                 for ssm_mode in ssm_modes:
-                    set_seed(args.seed)
-                    test_loader, _, _ = build_test_data_loader(dataset_name, args.data_root, preprocess, shuffle=False)
-                    if args.wandb_log:
-                        import wandb
-                        wandb.init(project=args.wandb_project, name=f"{dataset_name}_ssm_{ssm_mode}_L{stream_len}", reinit=True)
+                    # set_seed(args.seed)
+                    # test_loader, _, _ = build_test_data_loader(dataset_name, args.data_root, preprocess, shuffle=False)
+                    # if args.wandb_log:
+                    #     import wandb
+                    #     wandb.init(project=args.wandb_project, name=f"{dataset_name}_ssm_{ssm_mode}_L{stream_len}", reinit=True)
 
-                    result = run_test_tda(
-                        cfg_base['positive'],
-                        cfg_base['negative'],
-                        test_loader,
-                        clip_model,
-                        clip_weights,
-                        memory_type='ssm',
-                        max_samples=stream_len,
-                        enable_wandb=args.wandb_log,
-                        log_interval=max(1, stream_len // 5),
-                        return_details=True,
-                        ssm_kwargs={
-                            'correction_mode': ssm_mode,
-                            'kalman_q': args.kalman_q,
-                            'kalman_r': args.kalman_r,
-                            'kalman_q_min': args.kalman_q_min,
-                            'kalman_q_max': args.kalman_q_max,
-                            'kalman_r_min': args.kalman_r_min,
-                            'kalman_r_max': args.kalman_r_max,
-                        },
-                    )
+                    # result = run_test_tda(
+                    #     cfg_base['positive'],
+                    #     cfg_base['negative'],
+                    #     test_loader,
+                    #     clip_model,
+                    #     clip_weights,
+                    #     memory_type='ssm',
+                    #     max_samples=stream_len,
+                    #     enable_wandb=args.wandb_log,
+                    #     log_interval=max(1, stream_len // 5),
+                    #     return_details=True,
+                    #     ssm_kwargs={
+                    #         'correction_mode': ssm_mode,
+                    #         'kalman_q': args.kalman_q,
+                    #         'kalman_r': args.kalman_r,
+                    #         'kalman_q_min': args.kalman_q_min,
+                    #         'kalman_q_max': args.kalman_q_max,
+                    #         'kalman_r_min': args.kalman_r_min,
+                    #         'kalman_r_max': args.kalman_r_max,
+                    #     },
+                    # )
 
-                    if args.wandb_log:
-                        import wandb
-                        wandb.finish()
+                    # if args.wandb_log:
+                    #     import wandb
+                    #     wandb.finish()
 
-                    method_name = f'tda_ssm_{ssm_mode}'
-                    peak_mem_mb = result.get('peak_cuda_memory_mb', result.get('peak_mps_memory_mb', result.get('peak_device_memory_mb', 0.0)))
-                    summary_rows.append({
-                        'dataset': dataset_name,
-                        'method': method_name,
-                        'stream_length': stream_len,
-                        'cache_size': -1,
-                        'accuracy': result['accuracy'],
-                        'final_forgetting': result['final_forgetting'],
-                        'mean_forgetting': result['mean_forgetting'],
-                        'avg_step_time_ms': result['avg_step_time_ms'],
-                        'total_runtime_s': result['total_runtime_s'],
-                        'peak_device_memory_mb': peak_mem_mb,
-                        'adapter_memory_mb': result['adapter_memory_mb'],
-                        'num_samples': result['num_samples'],
-                    })
+                    # method_name = f'tda_ssm_{ssm_mode}'
+                    # peak_mem_mb = result.get('peak_cuda_memory_mb', result.get('peak_mps_memory_mb', result.get('peak_device_memory_mb', 0.0)))
+                    # summary_rows.append({
+                    #     'dataset': dataset_name,
+                    #     'method': method_name,
+                    #     'stream_length': stream_len,
+                    #     'cache_size': -1,
+                    #     'accuracy': result['accuracy'],
+                    #     'final_forgetting': result['final_forgetting'],
+                    #     'mean_forgetting': result['mean_forgetting'],
+                    #     'avg_step_time_ms': result['avg_step_time_ms'],
+                    #     'total_runtime_s': result['total_runtime_s'],
+                    #     'peak_device_memory_mb': peak_mem_mb,
+                    #     'adapter_memory_mb': result['adapter_memory_mb'],
+                    #     'num_samples': result['num_samples'],
+                    # })
 
-                    for step in range(0, len(result['cumulative_accuracy']), args.curve_stride):
-                        curve_rows.append({
-                            'dataset': dataset_name,
-                            'method': method_name,
-                            'stream_length': stream_len,
-                            'step': step + 1,
-                            'cumulative_accuracy': result['cumulative_accuracy'][step],
-                            'forgetting': result['forgetting_curve'][step],
-                        })
+                    # for step in range(0, len(result['cumulative_accuracy']), args.curve_stride):
+                    #     curve_rows.append({
+                    #         'dataset': dataset_name,
+                    #         'method': method_name,
+                    #         'stream_length': stream_len,
+                    #         'step': step + 1,
+                    #         'cumulative_accuracy': result['cumulative_accuracy'][step],
+                    #         'forgetting': result['forgetting_curve'][step],
+                    #     })
+
+                    if 'on' in anchor_modes:
+                        for reservoir_size in anchor_reservoir_sizes:
+                            for anchor_alpha in anchor_alphas:
+                                for anchor_beta in anchor_betas:
+                                    for anchor_entropy_threshold in anchor_entropy_thresholds:
+                                        set_seed(args.seed)
+                                        test_loader, _, _ = build_test_data_loader(dataset_name, args.data_root, preprocess, shuffle=False)
+                                        if args.wandb_log:
+                                            import wandb
+                                            wandb.init(
+                                                project=args.wandb_project,
+                                                name=(
+                                                    f"{dataset_name}_ssm_{ssm_mode}_anchor"
+                                                    f"_r{reservoir_size}_a{anchor_alpha}_b{anchor_beta}_e{anchor_entropy_threshold}_L{stream_len}"
+                                                ),
+                                                reinit=True,
+                                            )
+
+                                        anchor_result = run_test_tda(
+                                            cfg_base['positive'],
+                                            cfg_base['negative'],
+                                            test_loader,
+                                            clip_model,
+                                            clip_weights,
+                                            memory_type='ssm',
+                                            max_samples=stream_len,
+                                            enable_wandb=args.wandb_log,
+                                            log_interval=max(1, stream_len // 5),
+                                            return_details=True,
+                                            ssm_kwargs={
+                                                'correction_mode': ssm_mode,
+                                                'kalman_q': args.kalman_q,
+                                                'kalman_r': args.kalman_r,
+                                                'kalman_q_min': args.kalman_q_min,
+                                                'kalman_q_max': args.kalman_q_max,
+                                                'kalman_r_min': args.kalman_r_min,
+                                                'kalman_r_max': args.kalman_r_max,
+                                            },
+                                            anchor_kwargs={
+                                                'enabled': True,
+                                                'capacity': reservoir_size,
+                                                'entropy_threshold': anchor_entropy_threshold,
+                                                'alpha': anchor_alpha,
+                                                'beta': anchor_beta,
+                                            },
+                                        )
+
+                                        if args.wandb_log:
+                                            import wandb
+                                            wandb.finish()
+
+                                        anchor_method_name = (
+                                            f'tda_ssm_{ssm_mode}_anchor'
+                                            f'_r{reservoir_size}_a{anchor_alpha}_b{anchor_beta}_e{anchor_entropy_threshold}'
+                                        )
+                                        peak_mem_mb = anchor_result.get('peak_cuda_memory_mb', anchor_result.get('peak_mps_memory_mb', anchor_result.get('peak_device_memory_mb', 0.0)))
+                                        row = {
+                                            'dataset': dataset_name,
+                                            'method': anchor_method_name,
+                                            'stream_length': stream_len,
+                                            'cache_size': -1,
+                                            'accuracy': anchor_result['accuracy'],
+                                            'final_forgetting': anchor_result['final_forgetting'],
+                                            'mean_forgetting': anchor_result['mean_forgetting'],
+                                            'avg_step_time_ms': anchor_result['avg_step_time_ms'],
+                                            'total_runtime_s': anchor_result['total_runtime_s'],
+                                            'peak_device_memory_mb': peak_mem_mb,
+                                            'adapter_memory_mb': anchor_result['adapter_memory_mb'],
+                                            'num_samples': anchor_result['num_samples'],
+                                            'anchor_reservoir_size': reservoir_size,
+                                            'anchor_alpha': anchor_alpha,
+                                            'anchor_beta': anchor_beta,
+                                            'anchor_entropy_threshold': anchor_entropy_threshold,
+                                        }
+                                        for key in [
+                                            'anchor_update_accept_count',
+                                            'anchor_update_attempt_count',
+                                            'anchor_update_accept_rate',
+                                            'anchor_fill_ratio',
+                                            'avg_anchor_fill_ratio',
+                                            'avg_anchor_correction_active_rate',
+                                            'avg_anchor_correction_norm',
+                                        ]:
+                                            if key in anchor_result:
+                                                row[key] = anchor_result[key]
+                                        summary_rows.append(row)
+
+                                        for step in range(0, len(anchor_result['cumulative_accuracy']), args.curve_stride):
+                                            curve_row = {
+                                                'dataset': dataset_name,
+                                                'method': anchor_method_name,
+                                                'stream_length': stream_len,
+                                                'step': step + 1,
+                                                'cumulative_accuracy': anchor_result['cumulative_accuracy'][step],
+                                                'forgetting': anchor_result['forgetting_curve'][step],
+                                            }
+                                            if 'anchor_update_accept_rate_curve' in anchor_result:
+                                                curve_row['anchor_update_accept_rate'] = anchor_result['anchor_update_accept_rate_curve'][step]
+                                            if 'anchor_fill_ratio_curve' in anchor_result:
+                                                curve_row['anchor_fill_ratio'] = anchor_result['anchor_fill_ratio_curve'][step]
+                                            if 'anchor_correction_active_rate_curve' in anchor_result:
+                                                curve_row['anchor_correction_active_rate'] = anchor_result['anchor_correction_active_rate_curve'][step]
+                                            if 'anchor_correction_norm_curve' in anchor_result:
+                                                curve_row['anchor_correction_norm'] = anchor_result['anchor_correction_norm_curve'][step]
+                                            curve_rows.append(curve_row)
+
+            if len(mamba3_modes) > 0:
+                for mamba3_mode in mamba3_modes:
+                    phase_strength_values = mamba3_phase_strengths if mamba3_mode == 'mamba3-complex' else [0.0]
+                    slot_values = mamba3_num_slots if mamba3_mode == 'mamba3-multislot' else [1]
+                    for phase_strength in phase_strength_values:
+                        for num_slots in slot_values:
+                            for slot_threshold in mamba3_new_slot_thresholds:
+                                anchor_cfgs = [None]
+                                if 'on' in anchor_modes:
+                                    anchor_cfgs.extend([
+                                        {
+                                            'capacity': reservoir_size,
+                                            'entropy_threshold': anchor_entropy_threshold,
+                                            'alpha': anchor_alpha,
+                                            'beta': anchor_beta,
+                                        }
+                                        for reservoir_size in anchor_reservoir_sizes
+                                        for anchor_alpha in anchor_alphas
+                                        for anchor_beta in anchor_betas
+                                        for anchor_entropy_threshold in anchor_entropy_thresholds
+                                    ])
+
+                                for anchor_cfg in anchor_cfgs:
+                                    set_seed(args.seed)
+                                    test_loader, _, _ = build_test_data_loader(dataset_name, args.data_root, preprocess, shuffle=False)
+                                    if args.wandb_log:
+                                        import wandb
+                                        run_name = (
+                                            f"{dataset_name}_{mamba3_mode}"
+                                            f"_ps{phase_strength}_slots{num_slots}_thr{slot_threshold}"
+                                        )
+                                        if anchor_cfg is not None:
+                                            run_name += (
+                                                f"_anchor_r{anchor_cfg['capacity']}"
+                                                f"_a{anchor_cfg['alpha']}"
+                                                f"_b{anchor_cfg['beta']}"
+                                                f"_e{anchor_cfg['entropy_threshold']}"
+                                            )
+                                        wandb.init(project=args.wandb_project, name=f"{run_name}_L{stream_len}", reinit=True)
+
+                                    result = run_test_tda(
+                                        cfg_base['positive'],
+                                        cfg_base['negative'],
+                                        test_loader,
+                                        clip_model,
+                                        clip_weights,
+                                        memory_type='ssm-mamba3',
+                                        max_samples=stream_len,
+                                        enable_wandb=args.wandb_log,
+                                        log_interval=max(1, stream_len // 5),
+                                        return_details=True,
+                                        ssm_kwargs={
+                                            'correction_mode': args.ssm_correction_modes.split(',')[0].strip() if args.ssm_correction_modes else 'heuristic',
+                                            'kalman_q': args.kalman_q,
+                                            'kalman_r': args.kalman_r,
+                                            'kalman_q_min': args.kalman_q_min,
+                                            'kalman_q_max': args.kalman_q_max,
+                                            'kalman_r_min': args.kalman_r_min,
+                                            'kalman_r_max': args.kalman_r_max,
+                                            'mamba3_mode': mamba3_mode,
+                                            'mamba3_min_blend': args.mamba3_min_blend,
+                                            'mamba3_max_blend': args.mamba3_max_blend,
+                                            'mamba3_phase_strength': phase_strength,
+                                            'mamba3_num_slots': num_slots,
+                                            'mamba3_new_slot_threshold': slot_threshold,
+                                        },
+                                        anchor_kwargs={
+                                            'enabled': True,
+                                            'capacity': anchor_cfg['capacity'],
+                                            'entropy_threshold': anchor_cfg['entropy_threshold'],
+                                            'alpha': anchor_cfg['alpha'],
+                                            'beta': anchor_cfg['beta'],
+                                        } if anchor_cfg is not None else None,
+                                    )
+
+                                    if args.wandb_log:
+                                        import wandb
+                                        wandb.finish()
+
+                                    method_name = (
+                                        f'{mamba3_mode}'
+                                        f'_ps{phase_strength}_slots{num_slots}_thr{slot_threshold}'
+                                    )
+                                    if anchor_cfg is not None:
+                                        method_name += (
+                                            f"_anchor_r{anchor_cfg['capacity']}"
+                                            f"_a{anchor_cfg['alpha']}"
+                                            f"_b{anchor_cfg['beta']}"
+                                            f"_e{anchor_cfg['entropy_threshold']}"
+                                        )
+                                    peak_mem_mb = result.get('peak_cuda_memory_mb', result.get('peak_mps_memory_mb', result.get('peak_device_memory_mb', 0.0)))
+                                    row = {
+                                        'dataset': dataset_name,
+                                        'method': method_name,
+                                        'stream_length': stream_len,
+                                        'cache_size': -1,
+                                        'accuracy': result['accuracy'],
+                                        'final_forgetting': result['final_forgetting'],
+                                        'mean_forgetting': result['mean_forgetting'],
+                                        'avg_step_time_ms': result['avg_step_time_ms'],
+                                        'total_runtime_s': result['total_runtime_s'],
+                                        'peak_device_memory_mb': peak_mem_mb,
+                                        'adapter_memory_mb': result['adapter_memory_mb'],
+                                        'num_samples': result['num_samples'],
+                                        'mamba3_mode': mamba3_mode,
+                                        'mamba3_phase_strength': phase_strength,
+                                        'mamba3_num_slots': num_slots,
+                                        'mamba3_new_slot_threshold': slot_threshold,
+                                    }
+                                    if anchor_cfg is not None:
+                                        row['anchor_reservoir_size'] = anchor_cfg['capacity']
+                                        row['anchor_alpha'] = anchor_cfg['alpha']
+                                        row['anchor_beta'] = anchor_cfg['beta']
+                                        row['anchor_entropy_threshold'] = anchor_cfg['entropy_threshold']
+                                    for key in [
+                                        'mamba3_update_accept_count',
+                                        'mamba3_update_attempt_count',
+                                        'mamba3_update_accept_rate',
+                                        'mamba3_active_slot_ratio',
+                                        'mamba3_avg_slot_utilization',
+                                        'mamba3_avg_phase_magnitude',
+                                        'mamba3_avg_alpha',
+                                        'mamba3_avg_beta',
+                                        'mamba3_avg_gamma',
+                                        'anchor_update_accept_count',
+                                        'anchor_update_attempt_count',
+                                        'anchor_update_accept_rate',
+                                        'anchor_fill_ratio',
+                                        'avg_anchor_fill_ratio',
+                                        'avg_anchor_correction_active_rate',
+                                        'avg_anchor_correction_norm',
+                                    ]:
+                                        if key in result:
+                                            row[key] = result[key]
+                                    summary_rows.append(row)
+
+                                    for step in range(0, len(result['cumulative_accuracy']), args.curve_stride):
+                                        curve_row = {
+                                            'dataset': dataset_name,
+                                            'method': method_name,
+                                            'stream_length': stream_len,
+                                            'step': step + 1,
+                                            'cumulative_accuracy': result['cumulative_accuracy'][step],
+                                            'forgetting': result['forgetting_curve'][step],
+                                        }
+                                        if 'anchor_update_accept_rate_curve' in result:
+                                            curve_row['anchor_update_accept_rate'] = result['anchor_update_accept_rate_curve'][step]
+                                        if 'anchor_fill_ratio_curve' in result:
+                                            curve_row['anchor_fill_ratio'] = result['anchor_fill_ratio_curve'][step]
+                                        if 'anchor_correction_active_rate_curve' in result:
+                                            curve_row['anchor_correction_active_rate'] = result['anchor_correction_active_rate_curve'][step]
+                                        if 'anchor_correction_norm_curve' in result:
+                                            curve_row['anchor_correction_norm'] = result['anchor_correction_norm_curve'][step]
+                                        curve_rows.append(curve_row)
 
             # Consensus-gated SSM runs
             if run_consensus:
@@ -268,6 +538,13 @@ def run_head_to_head(args):
                                 method_name = f'tda_ssm_{ssm_mode}_cv{consensus_kwargs["n_views"]}_k{top_k}_t{cthresh}'
                                 if args.dynamic_view_budget:
                                     method_name += '_dyn'
+                                if args.consensus_enable_anchor_reservoir:
+                                    method_name += (
+                                        f'_anchor_r{args.consensus_anchor_reservoir_size}'
+                                        f'_a{args.consensus_anchor_alpha}'
+                                        f'_b{args.consensus_anchor_beta}'
+                                        f'_e{args.consensus_anchor_entropy_threshold}'
+                                    )
                                 if args.wandb_log:
                                     import wandb
                                     wandb.init(project=args.wandb_project,
@@ -295,6 +572,13 @@ def run_head_to_head(args):
                                         'kalman_r_max': args.kalman_r_max,
                                     },
                                     consensus_kwargs=consensus_kwargs,
+                                    anchor_kwargs={
+                                        'enabled': True,
+                                        'capacity': args.consensus_anchor_reservoir_size,
+                                        'entropy_threshold': args.consensus_anchor_entropy_threshold,
+                                        'alpha': args.consensus_anchor_alpha,
+                                        'beta': args.consensus_anchor_beta,
+                                    } if args.consensus_enable_anchor_reservoir else None,
                                 )
 
                                 if args.wandb_log:
@@ -328,6 +612,22 @@ def run_head_to_head(args):
                                     row['avg_view_savings'] = result['avg_view_savings']
                                 if 'early_stop_rate' in result:
                                     row['early_stop_rate'] = result['early_stop_rate']
+                                if args.consensus_enable_anchor_reservoir:
+                                    row['anchor_reservoir_size'] = args.consensus_anchor_reservoir_size
+                                    row['anchor_alpha'] = args.consensus_anchor_alpha
+                                    row['anchor_beta'] = args.consensus_anchor_beta
+                                    row['anchor_entropy_threshold'] = args.consensus_anchor_entropy_threshold
+                                for key in [
+                                    'anchor_update_accept_count',
+                                    'anchor_update_attempt_count',
+                                    'anchor_update_accept_rate',
+                                    'anchor_fill_ratio',
+                                    'avg_anchor_fill_ratio',
+                                    'avg_anchor_correction_active_rate',
+                                    'avg_anchor_correction_norm',
+                                ]:
+                                    if key in result:
+                                        row[key] = result[key]
                                 summary_rows.append(row)
 
                                 for step in range(0, len(result['cumulative_accuracy']), args.curve_stride):
@@ -349,6 +649,14 @@ def run_head_to_head(args):
                                         curve_row['avg_views_used'] = result['avg_views_used_curve'][step]
                                     if 'avg_view_savings_curve' in result:
                                         curve_row['avg_view_savings'] = result['avg_view_savings_curve'][step]
+                                    if 'anchor_update_accept_rate_curve' in result:
+                                        curve_row['anchor_update_accept_rate'] = result['anchor_update_accept_rate_curve'][step]
+                                    if 'anchor_fill_ratio_curve' in result:
+                                        curve_row['anchor_fill_ratio'] = result['anchor_fill_ratio_curve'][step]
+                                    if 'anchor_correction_active_rate_curve' in result:
+                                        curve_row['anchor_correction_active_rate'] = result['anchor_correction_active_rate_curve'][step]
+                                    if 'anchor_correction_norm_curve' in result:
+                                        curve_row['anchor_correction_norm'] = result['anchor_correction_norm_curve'][step]
                                     curve_rows.append(curve_row)
 
     summary_csv = os.path.join(args.output_dir, 'summary.csv')
@@ -406,6 +714,17 @@ def get_args():
     parser.add_argument('--kalman-r-max', type=float, default=0.1, help='Maximum adaptive Kalman observation noise R.')
     parser.add_argument('--wandb-log', action='store_true', help='Enable wandb logging for each run.')
     parser.add_argument('--wandb-project', type=str, default='TDA-Benchmark', help='Wandb project name.')
+    parser.add_argument('--anchor-modes', type=str, default='off,on', help='Comma-separated anchor benchmark modes. Use off,on to include anchor-enabled runs.')
+    parser.add_argument('--anchor-reservoir-sizes', type=str, default='4', help='Comma-separated anchor reservoir sizes.')
+    parser.add_argument('--anchor-alphas', type=str, default='0.6', help='Comma-separated anchor correction strengths.')
+    parser.add_argument('--anchor-betas', type=str, default='1.5', help='Comma-separated anchor layer weighting temperatures.')
+    parser.add_argument('--anchor-entropy-thresholds', type=str, default='0.25', help='Comma-separated anchor entropy thresholds.')
+    parser.add_argument('--mamba3-modes', type=str, default='', help='Comma-separated Mamba-3-inspired modes to benchmark (empty=disabled).')
+    parser.add_argument('--mamba3-min-blend', type=float, default=0.02, help='Minimum selective blend factor for Mamba-3-inspired runs.')
+    parser.add_argument('--mamba3-max-blend', type=float, default=0.35, help='Maximum selective blend factor for Mamba-3-inspired runs.')
+    parser.add_argument('--mamba3-phase-strengths', type=str, default='0.15', help='Comma-separated phase strengths for Mamba-3-inspired runs.')
+    parser.add_argument('--mamba3-num-slots', type=str, default='4', help='Comma-separated slot counts for Mamba-3-inspired runs.')
+    parser.add_argument('--mamba3-new-slot-thresholds', type=str, default='0.25', help='Comma-separated slot allocation thresholds for Mamba-3-inspired runs.')
     # Consensus gating parameters
     parser.add_argument('--n-views', type=str, default='', help='Comma-separated n_views values for consensus gating (empty=disabled).')
     parser.add_argument('--top-k', type=str, default='5', help='Comma-separated top-K values for consensus masking.')
@@ -417,6 +736,11 @@ def get_args():
     parser.add_argument('--single-view-margin', type=float, default=0.35, help='Top-1 minus top-2 probability margin needed to stop after one view.')
     parser.add_argument('--early-stop-score', type=float, default=0.60, help='Soft agreement score needed to stop early after the initial dynamic view budget.')
     parser.add_argument('--early-stop-margin', type=float, default=0.25, help='Probability margin needed to stop early after the initial dynamic view budget.')
+    parser.add_argument('--consensus-enable-anchor-reservoir', action='store_true', help='Enable anchor reservoir for consensus-gated runs.')
+    parser.add_argument('--consensus-anchor-reservoir-size', type=int, default=4, help='Anchor reservoir size for consensus-gated runs.')
+    parser.add_argument('--consensus-anchor-entropy-threshold', type=float, default=0.25, help='Anchor entropy threshold for consensus-gated runs.')
+    parser.add_argument('--consensus-anchor-alpha', type=float, default=0.6, help='Anchor correction strength for consensus-gated runs.')
+    parser.add_argument('--consensus-anchor-beta', type=float, default=1.5, help='Anchor layer weighting temperature for consensus-gated runs.')
     return parser.parse_args()
 
 

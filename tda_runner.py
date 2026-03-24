@@ -9,7 +9,7 @@ import torch
 
 import clip
 from utils import *
-from memory import AnchorReservoir, CacheMemory, SSMemory
+from memory import AnchorReservoir, CacheMemory, Mamba3Memory, SSMemory
 
 wandb = None
 
@@ -23,7 +23,7 @@ def get_arguments():
     parser.add_argument('--data-root', dest='data_root', type=str, default='./dataset/', help='Path to the datasets directory. Default is ./dataset/')
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
     parser.add_argument('--device', dest='device', type=str, choices=['auto', 'cuda', 'mps', 'cpu'], default='auto', help='Execution device. Default: auto')
-    parser.add_argument('--memory-type', dest='memory_type', type=str, choices=['cache', 'ssm'], default='cache', help='Adapter memory backend: original finite cache or SSM memory. Default is cache.')
+    parser.add_argument('--memory-type', dest='memory_type', type=str, choices=['cache', 'ssm', 'ssm-mamba3'], default='cache', help='Adapter memory backend: original finite cache, current SSM, or Mamba-3-inspired SSM. Default is cache.')
     parser.add_argument('--ssm-correction-mode', dest='ssm_correction_mode', type=str, choices=['heuristic', 'kalman-fixed', 'kalman-adaptive', 'kalman-decoupled', 'vmf-fixed', 'vmf-adaptive', 'vmf-online'], default='heuristic', help='SSM state correction: heuristic, vMF-fixed, vMF-adaptive, vMF-online (Kalman names remain as aliases). Default: heuristic.')
     parser.add_argument('--kalman-q', dest='kalman_q', type=float, default=0.01, help='Fixed Kalman process noise (Q) for --ssm-correction-mode kalman-fixed.')
     parser.add_argument('--kalman-r', dest='kalman_r', type=float, default=0.05, help='Fixed Kalman observation noise (R) for --ssm-correction-mode kalman-fixed.')
@@ -47,6 +47,12 @@ def get_arguments():
     parser.add_argument('--anchor-entropy-threshold', dest='anchor_entropy_threshold', type=float, default=0.25, help='Maximum normalized entropy for adding a sample to the anchor reservoir.')
     parser.add_argument('--anchor-alpha', dest='anchor_alpha', type=float, default=0.6, help='Strength of anchor-based logit correction.')
     parser.add_argument('--anchor-beta', dest='anchor_beta', type=float, default=1.5, help='Layer weighting temperature for anchor-based logit correction.')
+    parser.add_argument('--mamba3-mode', dest='mamba3_mode', type=str, choices=['mamba3-trapezoid', 'mamba3-complex', 'mamba3-multislot'], default='mamba3-trapezoid', help='Mamba-3-inspired memory variant.')
+    parser.add_argument('--mamba3-min-blend', dest='mamba3_min_blend', type=float, default=0.02, help='Minimum selective blend factor for Mamba-3-inspired memory.')
+    parser.add_argument('--mamba3-max-blend', dest='mamba3_max_blend', type=float, default=0.35, help='Maximum selective blend factor for Mamba-3-inspired memory.')
+    parser.add_argument('--mamba3-phase-strength', dest='mamba3_phase_strength', type=float, default=0.15, help='Phase rotation strength for mamba3-complex.')
+    parser.add_argument('--mamba3-num-slots', dest='mamba3_num_slots', type=int, default=4, help='Number of per-class state slots for mamba3-multislot.')
+    parser.add_argument('--mamba3-new-slot-threshold', dest='mamba3_new_slot_threshold', type=float, default=0.25, help='Similarity threshold for allocating a new slot in mamba3-multislot.')
 
     args = parser.parse_args()
 
@@ -59,6 +65,20 @@ def _build_memory(backend, params, clip_weights, image_features, include_prob_ma
 
     if ssm_kwargs is None:
         ssm_kwargs = {}
+
+    if backend == 'ssm-mamba3':
+        return Mamba3Memory(
+            num_classes=clip_weights.size(1),
+            feature_dim=image_features.size(1),
+            device=image_features.device,
+            include_prob_map=include_prob_map,
+            mode=ssm_kwargs['mamba3_mode'],
+            min_blend=ssm_kwargs['mamba3_min_blend'],
+            max_blend=ssm_kwargs['mamba3_max_blend'],
+            phase_strength=ssm_kwargs['mamba3_phase_strength'],
+            num_slots=ssm_kwargs['mamba3_num_slots'],
+            new_slot_threshold=ssm_kwargs['mamba3_new_slot_threshold'],
+        )
 
     return SSMemory(
         num_classes=clip_weights.size(1),
@@ -157,6 +177,10 @@ def run_test_tda(
         views_used_history = []
         view_savings_history = []
         early_stop_count = 0
+        anchor_fill_ratio_history = []
+        anchor_accept_flag_history = []
+        anchor_correction_active_history = []
+        anchor_correction_norm_history = []
         if device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -180,20 +204,20 @@ def run_test_tda(
 
             if use_consensus:
                 if dynamic_view_budget:
-                    image_features, clip_logits, loss, prob_map, pred, consensus_stats = \
+                    image_features, clip_logits, loss, prob_map, pred, consensus_stats, visual_details = \
                         dynamic_multiview_consensus_logits(images, clip_model, clip_weights,
                                                            top_k=top_k,
                                                            consensus_threshold=consensus_threshold,
                                                            dynamic_kwargs=dynamic_kwargs,
-                                                           device=device)
-                    visual_details = {'layer_cls_tokens': None, 'supports_anchor': False}
+                                                           device=device,
+                                                           return_layer_cls=anchor_enabled)
                 else:
-                    image_features, clip_logits, loss, prob_map, pred, consensus_stats = \
+                    image_features, clip_logits, loss, prob_map, pred, consensus_stats, visual_details = \
                         multiview_consensus_logits(images, clip_model, clip_weights,
                                                   top_k=top_k,
                                                   consensus_threshold=consensus_threshold,
-                                                  device=device)
-                    visual_details = {'layer_cls_tokens': None, 'supports_anchor': False}
+                                                  device=device,
+                                                  return_layer_cls=anchor_enabled)
                 consensus_total_count += 1
                 if consensus_stats['soft_accept']:
                     consensus_accept_count += 1
@@ -242,13 +266,19 @@ def run_test_tda(
                 else:
                     neg_memory.update(pred, image_features, prop_entropy, prob_map=prob_map, update_weight=update_weight)
 
+            anchor_update_accepted = False
             if anchor_memory is not None:
-                anchor_memory.update(
+                anchor_update_accepted = anchor_memory.update(
                     pred,
                     visual_details.get('layer_cls_tokens'),
                     prop_entropy,
                     update_weight=update_weight,
                 )
+                anchor_fill_ratio_history.append(anchor_memory.fill_ratio())
+                anchor_accept_flag_history.append(1.0 if anchor_update_accepted else 0.0)
+            else:
+                anchor_fill_ratio_history.append(0.0)
+                anchor_accept_flag_history.append(0.0)
 
             final_logits = clip_logits.clone()
             if pos_enabled and pos_memory is not None and not pos_memory.is_empty():
@@ -261,12 +291,19 @@ def run_test_tda(
                     clip_weights,
                     (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper'])
                 )
+            anchor_correction = None
             if anchor_memory is not None and not anchor_memory.is_empty():
-                final_logits += anchor_memory.logits(
+                anchor_correction = anchor_memory.logits(
                     visual_details.get('layer_cls_tokens'),
                     anchor_kwargs['alpha'],
                     anchor_kwargs['beta'],
                 ).to(final_logits.dtype)
+                final_logits += anchor_correction
+
+            anchor_correction_active_history.append(1.0 if anchor_correction is not None else 0.0)
+            anchor_correction_norm_history.append(
+                float(anchor_correction.norm().item()) if anchor_correction is not None else 0.0
+            )
 
                 
             acc = cls_acc(final_logits, target)  
@@ -333,6 +370,36 @@ def run_test_tda(
                 details['avg_view_savings_curve'] = (view_savings_prefix / steps).tolist()
                 if dynamic_view_budget:
                     details['early_stop_rate'] = early_stop_count / consensus_total_count
+        if anchor_memory is not None:
+            anchor_stats = anchor_memory.stats()
+            details['anchor_update_accept_count'] = anchor_stats['accepted_updates']
+            details['anchor_update_attempt_count'] = anchor_stats['total_update_attempts']
+            details['anchor_update_accept_rate'] = anchor_stats['accept_rate']
+            details['anchor_fill_ratio'] = anchor_stats['fill_ratio']
+            if len(anchor_fill_ratio_history) > 0:
+                anchor_fill_prefix = np.cumsum(np.array(anchor_fill_ratio_history, dtype=np.float64))
+                anchor_accept_prefix = np.cumsum(np.array(anchor_accept_flag_history, dtype=np.float64))
+                anchor_active_prefix = np.cumsum(np.array(anchor_correction_active_history, dtype=np.float64))
+                anchor_norm_prefix = np.cumsum(np.array(anchor_correction_norm_history, dtype=np.float64))
+                anchor_steps = np.arange(1, len(anchor_fill_ratio_history) + 1, dtype=np.float64)
+                details['avg_anchor_fill_ratio'] = float(anchor_fill_prefix[-1] / anchor_steps[-1])
+                details['avg_anchor_correction_active_rate'] = float(anchor_active_prefix[-1] / anchor_steps[-1])
+                details['avg_anchor_correction_norm'] = float(anchor_norm_prefix[-1] / anchor_steps[-1])
+                details['anchor_update_accept_rate_curve'] = (anchor_accept_prefix / anchor_steps).tolist()
+                details['anchor_fill_ratio_curve'] = (anchor_fill_prefix / anchor_steps).tolist()
+                details['anchor_correction_active_rate_curve'] = (anchor_active_prefix / anchor_steps).tolist()
+                details['anchor_correction_norm_curve'] = (anchor_norm_prefix / anchor_steps).tolist()
+        if memory_type == 'ssm-mamba3' and pos_memory is not None:
+            mamba3_stats = pos_memory.stats()
+            details['mamba3_update_accept_count'] = mamba3_stats['accepted_updates']
+            details['mamba3_update_attempt_count'] = mamba3_stats['total_update_attempts']
+            details['mamba3_update_accept_rate'] = mamba3_stats['accept_rate']
+            details['mamba3_active_slot_ratio'] = mamba3_stats['active_slot_ratio']
+            details['mamba3_avg_slot_utilization'] = mamba3_stats['avg_slot_utilization']
+            details['mamba3_avg_phase_magnitude'] = mamba3_stats['avg_phase_magnitude']
+            details['mamba3_avg_alpha'] = mamba3_stats['avg_alpha']
+            details['mamba3_avg_beta'] = mamba3_stats['avg_beta']
+            details['mamba3_avg_gamma'] = mamba3_stats['avg_gamma']
         return details
 
 
@@ -370,6 +437,12 @@ def main():
         'kalman_q_max': args.kalman_q_max,
         'kalman_r_min': args.kalman_r_min,
         'kalman_r_max': args.kalman_r_max,
+        'mamba3_mode': args.mamba3_mode,
+        'mamba3_min_blend': args.mamba3_min_blend,
+        'mamba3_max_blend': args.mamba3_max_blend,
+        'mamba3_phase_strength': args.mamba3_phase_strength,
+        'mamba3_num_slots': args.mamba3_num_slots,
+        'mamba3_new_slot_threshold': args.mamba3_new_slot_threshold,
     }
     anchor_kwargs = {
         'enabled': args.enable_anchor_reservoir,
