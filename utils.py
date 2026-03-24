@@ -244,7 +244,7 @@ def _encode_views(view_tensors, clip_model, clip_weights, device, return_layer_c
         layer_cls_tokens = None
 
     features = _safe_normalize(raw_features, dim=-1)
-    logits = 100.0 * features @ clip_weights
+    logits = 100.0 * features @ clip_weights.to(features.dtype)
     return features, logits, layer_cls_tokens
 
 
@@ -287,7 +287,7 @@ def _compute_soft_consensus_outputs(all_features, all_logits, clip_weights, top_
         supports_anchor = False
     pred = int(mean_prob.argmax(dim=1).item())
 
-    denoised_logits = 100.0 * denoised_feature @ clip_weights
+    denoised_logits = 100.0 * denoised_feature @ clip_weights.to(denoised_feature.dtype)
     loss = -(mean_prob * torch.log(mean_prob + eps)).sum(dim=1)
     prob_map = mean_prob
 
