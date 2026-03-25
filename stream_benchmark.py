@@ -544,9 +544,8 @@ def run_head_to_head(args):
                             )
                         if args.enable_token_condensation:
                             method_name += (
-                                f'_tc_kr{args.token_keep_ratio}'
-                                f'_et{args.token_condense_entropy_threshold}'
-                                f'_mt{args.token_condense_margin_threshold}'
+                                f'_tca_dr{args.tca_drop_rate}'
+                                f'_rs{args.tca_reservoir_size}'
                             )
 
                         if args.wandb_log:
@@ -582,15 +581,15 @@ def run_head_to_head(args):
                             } if anchor_cfg is not None else None,
                             token_condense_kwargs={
                                 'enabled': args.enable_token_condensation,
-                                'backbone_scope': args.token_condense_backbone,
-                                'entropy_threshold': args.token_condense_entropy_threshold,
-                                'margin_threshold': args.token_condense_margin_threshold,
-                                'consensus_threshold': args.token_condense_consensus_threshold,
-                                'layers': [int(x.strip()) for x in args.token_condense_layers.split(',') if x.strip()],
-                                'keep_ratio': args.token_keep_ratio,
-                                'merge_ratio': args.token_merge_ratio,
-                                'max_samples_debug': args.token_condense_max_samples_debug,
-                                'min_keep_tokens': args.token_condense_min_keep_tokens,
+                                'mode': args.token_condensation_mode,
+                                'drop_rate': args.tca_drop_rate,
+                                'drop_locations': [int(x.strip()) for x in args.tca_drop_locations.split(',') if x.strip()],
+                                'reservoir_size': args.tca_reservoir_size,
+                                'scale': args.tca_scale,
+                                'lambd': args.tca_lambda,
+                                'beta': args.tca_beta,
+                                'use_token_sim': args.tca_use_token_sim,
+                                'diverse_cache': args.tca_diverse_cache,
                             } if args.enable_token_condensation else None,
                         )
 
@@ -619,10 +618,13 @@ def run_head_to_head(args):
                             row['anchor_beta'] = anchor_cfg['beta']
                             row['anchor_entropy_threshold'] = anchor_cfg['entropy_threshold']
                         if args.enable_token_condensation:
-                            row['token_keep_ratio'] = args.token_keep_ratio
-                            row['token_condense_entropy_threshold'] = args.token_condense_entropy_threshold
-                            row['token_condense_margin_threshold'] = args.token_condense_margin_threshold
-                            row['token_condense_layers'] = args.token_condense_layers
+                            row['token_condensation_mode'] = args.token_condensation_mode
+                            row['tca_drop_rate'] = args.tca_drop_rate
+                            row['tca_drop_locations'] = args.tca_drop_locations
+                            row['tca_reservoir_size'] = args.tca_reservoir_size
+                            row['tca_scale'] = args.tca_scale
+                            row['tca_lambda'] = args.tca_lambda
+                            row['tca_beta'] = args.tca_beta
                         for key in [
                             'anchor_update_accept_count',
                             'anchor_update_attempt_count',
@@ -639,10 +641,14 @@ def run_head_to_head(args):
                             'token_condense_apply_count',
                             'token_condense_attempt_rate',
                             'token_condense_apply_rate',
-                            'avg_token_condense_keep_ratio',
                             'avg_token_condense_kept_tokens',
+                            'avg_token_condense_merged_tokens',
                             'avg_token_condense_layers',
-                            'avg_token_condense_fallbacks',
+                            'tca_update_accept_count',
+                            'tca_update_attempt_count',
+                            'tca_update_accept_rate',
+                            'tca_fill_ratio',
+                            'avg_tca_fill_ratio',
                         ]:
                             if key in result:
                                 row[key] = result[key]
@@ -669,6 +675,8 @@ def run_head_to_head(args):
                                 curve_row['token_condense_attempt_rate'] = result['token_condense_attempt_rate_curve'][step]
                             if 'token_condense_apply_rate_curve' in result:
                                 curve_row['token_condense_apply_rate'] = result['token_condense_apply_rate_curve'][step]
+                            if 'tca_fill_ratio_curve' in result:
+                                curve_row['tca_fill_ratio'] = result['tca_fill_ratio_curve'][step]
                             curve_rows.append(curve_row)
 
             # Consensus-gated SSM runs
@@ -881,7 +889,7 @@ def get_args():
     parser.add_argument('--kalman-r-min', type=float, default=0.01, help='Minimum adaptive Kalman observation noise R.')
     parser.add_argument('--kalman-r-max', type=float, default=0.1, help='Maximum adaptive Kalman observation noise R.')
     parser.add_argument('--wandb-log', action='store_true', help='Enable wandb logging for each run.')
-    parser.add_argument('--wandb-project', type=str, default='TDA-Benchmark', help='Wandb project name.')
+    parser.add_argument('--wandb-project', type=str, default='TDA-Benchmark with SSM and TCA', help='Wandb project name.')
     parser.add_argument('--anchor-modes', type=str, default='off,on', help='Comma-separated anchor benchmark modes. Use off,on to include anchor-enabled runs.')
     parser.add_argument('--anchor-reservoir-sizes', type=str, default='4', help='Comma-separated anchor reservoir sizes.')
     parser.add_argument('--anchor-alphas', type=str, default='0.6', help='Comma-separated anchor correction strengths.')
@@ -909,16 +917,16 @@ def get_args():
     parser.add_argument('--consensus-anchor-entropy-threshold', type=float, default=0.25, help='Anchor entropy threshold for consensus-gated runs.')
     parser.add_argument('--consensus-anchor-alpha', type=float, default=0.6, help='Anchor correction strength for consensus-gated runs.')
     parser.add_argument('--consensus-anchor-beta', type=float, default=1.5, help='Anchor layer weighting temperature for consensus-gated runs.')
-    parser.add_argument('--enable-token-condensation', action='store_true', help='Enable uncertainty-triggered token condensation for single-view SSM runs.')
-    parser.add_argument('--token-condense-backbone', type=str, choices=['vit-only'], default='vit-only', help='Backbone scope for token condensation.')
-    parser.add_argument('--token-condense-entropy-threshold', type=float, default=0.25, help='Normalized entropy threshold for token condensation triggering.')
-    parser.add_argument('--token-condense-margin-threshold', type=float, default=0.20, help='Top-1/top-2 margin threshold for token condensation triggering.')
-    parser.add_argument('--token-condense-consensus-threshold', type=float, default=0.50, help='Consensus threshold placeholder for token condensation.')
-    parser.add_argument('--token-condense-layers', type=str, default='8,9,10,11', help='Comma-separated ViT layers where pruning can be applied.')
-    parser.add_argument('--token-keep-ratio', type=float, default=0.6, help='Fraction of patch tokens to keep when condensation is applied.')
-    parser.add_argument('--token-merge-ratio', type=float, default=0.0, help='Reserved for future token merging support.')
-    parser.add_argument('--token-condense-max-samples-debug', type=int, default=None, help='Optional cap on condensed samples for debugging.')
-    parser.add_argument('--token-condense-min-keep-tokens', type=int, default=16, help='Minimum number of patch tokens to preserve during pruning.')
+    parser.add_argument('--enable-token-condensation', action='store_true', help='Enable official-style TCA token condensation for single-view SSM runs.')
+    parser.add_argument('--token-condensation-mode', type=str, choices=['tca-ours'], default='tca-ours', help='Token condensation mode.')
+    parser.add_argument('--tca-drop-rate', type=float, default=0.035, help='Official-style TCA drop rate.')
+    parser.add_argument('--tca-drop-locations', type=str, default='3,6,9', help='Comma-separated ViT drop locations for TCA.')
+    parser.add_argument('--tca-reservoir-size', type=int, default=3, help='Per-class TCA reservoir size.')
+    parser.add_argument('--tca-scale', type=float, default=5.5, help='Layer scaling temperature for TCA logits.')
+    parser.add_argument('--tca-lambda', type=float, default=2.0, help='Strength of TCA reservoir logits.')
+    parser.add_argument('--tca-beta', type=float, default=6.0, help='Affinity sharpness for TCA reservoir logits.')
+    parser.add_argument('--tca-use-token-sim', action='store_true', help='Use token-level similarity for TCA reservoir eviction.')
+    parser.add_argument('--tca-diverse-cache', action='store_true', help='Prefer diverse samples in the TCA cache.')
     return parser.parse_args()
 
 

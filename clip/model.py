@@ -1,3 +1,4 @@
+import math
 from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -164,6 +165,55 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
+def complement_idx(idx: torch.Tensor, dim: int):
+    base = torch.arange(dim, device=idx.device).unsqueeze(0).expand(idx.size(0), -1)
+    mask = torch.ones_like(base, dtype=torch.bool)
+    mask.scatter_(1, idx, False)
+    return base[mask].view(idx.size(0), dim - idx.size(1))
+
+
+def _k_center_greedy(token: torch.Tensor, num_cluster: int):
+    n = token.shape[0]
+    if n == 0:
+        return token
+    num_cluster = max(1, min(int(num_cluster), n))
+    centers = [0]
+    min_distances = torch.norm(token - token[centers[0]], dim=1)
+    for _ in range(num_cluster - 1):
+        next_center = int(torch.argmax(min_distances).item())
+        centers.append(next_center)
+        new_distances = torch.norm(token - token[next_center], dim=1)
+        min_distances = torch.minimum(min_distances, new_distances)
+    return torch.stack([token[i] for i in centers], dim=0)
+
+
+def coreset_averaging(token: torch.Tensor, num_centers: int):
+    batch_size = token.shape[1]
+    feature_dim = token.shape[2]
+    if token.shape[0] == 0:
+        return torch.zeros(num_centers, batch_size, feature_dim, device=token.device, dtype=token.dtype)
+
+    num_centers = max(1, min(int(num_centers), token.shape[0]))
+    weighted_tokens = torch.zeros(num_centers, batch_size, feature_dim, device=token.device, dtype=token.dtype)
+    for b in range(batch_size):
+        token_batch = token[:, b, :]
+        centers = _k_center_greedy(token_batch.float(), num_centers)
+        distances = torch.cdist(token_batch.float(), centers.float())
+        cluster_assignment = torch.argmin(distances, dim=1)
+        for i in range(num_centers):
+            cluster_tokens = token_batch[cluster_assignment == i]
+            if cluster_tokens.shape[0] == 0:
+                continue
+            cluster_center = centers[i].to(token_batch.device, dtype=token_batch.dtype)
+            token_distances = torch.norm(cluster_tokens - cluster_center, dim=1)
+            epsilon = 1e-8
+            token_distances = torch.where(token_distances == 0, torch.full_like(token_distances, epsilon), token_distances)
+            weights = 1.0 / token_distances
+            weights = weights / weights.sum().clamp_min(epsilon)
+            weighted_tokens[i, b] = torch.sum(cluster_tokens * weights.unsqueeze(-1), dim=0)
+    return weighted_tokens
+
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -206,6 +256,92 @@ class ResidualAttentionBlock(nn.Module):
             return x, attn_weights
         return x
 
+    def forward_tca(
+        self,
+        x: torch.Tensor,
+        drop_rate: float = 0.0,
+        cls_token_cache: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,
+    ):
+        n_tokens, batch_size, channels = x.shape
+
+        if drop_rate <= 0.0:
+            if cls_token_cache is not None and layer_idx in [3, 6, 9]:
+                cls_token_cache = cls_token_cache.to(device=x.device, dtype=x.dtype)
+                max_token_cls = torch.argmax(
+                    F.cosine_similarity(cls_token_cache.unsqueeze(1), x[:1, :, :], dim=2),
+                    dim=0,
+                )
+                attn_input = torch.cat((cls_token_cache[max_token_cls].unsqueeze(0), x), dim=0)
+                tmp, attn_weights = self.attention(self.ln_1(attn_input), return_weights=True)
+                x = x + tmp[1:, :, :]
+            else:
+                x = x + self.attention(self.ln_1(x), return_weights=False)[0]
+            x = x + self.mlp(self.ln_2(x))
+            return x, {
+                "applied": False,
+                "kept_tokens": n_tokens - 1,
+                "merged_tokens": 0,
+                "extra_tokens": 0,
+            }
+
+        left_tokens = math.ceil((1.0 - drop_rate) * (n_tokens - 1))
+        left_tokens = max(1, min(left_tokens, n_tokens - 1))
+        merged_tokens_count = max(1, n_tokens - left_tokens)
+
+        if cls_token_cache is not None:
+            cls_token_cache = cls_token_cache.to(device=x.device, dtype=x.dtype)
+            max_token_cls = torch.argmax(
+                F.cosine_similarity(cls_token_cache.unsqueeze(1), x[:1, :, :], dim=2),
+                dim=0,
+            )
+            attn_input = torch.cat((cls_token_cache[max_token_cls].unsqueeze(0), x), dim=0)
+            tmp, attn_weights = self.attention(self.ln_1(attn_input), return_weights=True)
+            tmp = tmp[1:, :, :]
+            attn_weights = attn_weights[:, :, 1:, 1:]
+        else:
+            tmp, attn_weights = self.attention(self.ln_1(x), return_weights=True)
+
+        x = x + tmp
+        cls_attn = attn_weights[:, :, 0, 1:]
+        cls_attn = cls_attn.mean(dim=1)
+
+        keep_primary = max(1, left_tokens - 2 * merged_tokens_count)
+        keep_primary = min(keep_primary, cls_attn.size(1))
+        keep_total = min(max(1, left_tokens), cls_attn.size(1))
+
+        _, idx_primary = torch.topk(cls_attn, keep_primary, dim=1, largest=True, sorted=True)
+        _, idx_total = torch.topk(cls_attn, keep_total, dim=1, largest=True, sorted=True)
+        cluster_idx = idx_total[:, idx_primary.shape[1]:]
+
+        non_cls = x[1:, :, :]
+        keep_index = idx_primary.unsqueeze(-1).expand(-1, -1, channels).permute(1, 0, 2)
+        kept_tokens = torch.gather(non_cls, dim=0, index=keep_index)
+
+        merged_tokens = torch.zeros(0, batch_size, channels, device=x.device, dtype=x.dtype)
+        if cluster_idx.numel() > 0:
+            cluster_index = cluster_idx.unsqueeze(-1).expand(-1, -1, channels).permute(1, 0, 2)
+            cluster_tokens = torch.gather(non_cls, dim=0, index=cluster_index)
+            merge_centers = min(4, max(1, cluster_tokens.shape[0]))
+            merged_tokens = coreset_averaging(cluster_tokens, num_centers=merge_centers).to(dtype=x.dtype)
+
+        compl = complement_idx(idx_total, n_tokens - 1)
+        extra_token = torch.zeros(1, batch_size, channels, device=x.device, dtype=x.dtype)
+        if compl.numel() > 0:
+            compl_index = compl.unsqueeze(-1).expand(-1, -1, channels).permute(1, 0, 2)
+            non_topk = torch.gather(non_cls, dim=0, index=compl_index)
+            non_topk_attn = torch.gather(cls_attn, dim=1, index=compl).permute(1, 0)
+            extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=0, keepdim=True)
+
+        x = torch.cat([x[:1, :, :], kept_tokens, merged_tokens, extra_token], dim=0)
+        x = x + self.mlp(self.ln_2(x))
+        return x, {
+            "applied": True,
+            "kept_tokens": int(kept_tokens.shape[0]),
+            "merged_tokens": int(merged_tokens.shape[0]),
+            "extra_tokens": 1,
+        }
+
 
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
@@ -231,112 +367,13 @@ class VisionTransformer(nn.Module):
         self.ln_pre = LayerNorm(width)
 
         self.transformer = Transformer(width, layers, heads)
+        self.cls_token_cache = None
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def _normalize_scores(self, scores: torch.Tensor):
-        scores = torch.nan_to_num(scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        if scores.numel() == 0:
-            return scores
-        score_min = scores.min()
-        score_max = scores.max()
-        if float((score_max - score_min).abs().item()) < 1e-6:
-            return torch.ones_like(scores)
-        return (scores - score_min) / (score_max - score_min).clamp_min(1e-6)
-
-    def _project_tokens(self, tokens: torch.Tensor):
-        projected = self.ln_post(tokens)
-        if self.proj is not None:
-            projected = projected @ self.proj.to(dtype=projected.dtype)
-        return projected
-
-    def _compute_condensation_scores(
-        self,
-        x: torch.Tensor,
-        attn_weights: Optional[torch.Tensor],
-        layer_idx: int,
-        token_condense_config: Dict[str, Any],
-    ):
-        if x.size(1) != 1 or x.size(0) <= 2:
-            return None, False
-
-        patch_tokens = x[1:, 0, :].float()
-        if patch_tokens.size(0) == 0:
-            return None, False
-
-        score_terms = []
-        if attn_weights is not None and attn_weights.dim() == 4 and attn_weights.size(-1) == x.size(0):
-            cls_attn = torch.nan_to_num(attn_weights[0, :, 0, 1:].float(), nan=0.0, posinf=0.0, neginf=0.0)
-            attn_mean = self._normalize_scores(cls_attn.mean(dim=0))
-            agreement = self._normalize_scores(1.0 / (1.0 + cls_attn.std(dim=0, unbiased=False)))
-            score_terms.extend([attn_mean, agreement])
-
-        anchor_tokens = token_condense_config.get("anchor_tokens")
-        anchor_used = False
-        if anchor_tokens is not None and layer_idx < anchor_tokens.size(0):
-            anchor_layer = torch.nan_to_num(
-                anchor_tokens[layer_idx].to(device=patch_tokens.device, dtype=torch.float32),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            if torch.isfinite(anchor_layer).all() and float(anchor_layer.norm().item()) > 0.0:
-                projected_patches = self._project_tokens(patch_tokens)
-                projected_patches = F.normalize(projected_patches.float(), dim=-1)
-                anchor_layer = F.normalize(anchor_layer.unsqueeze(0), dim=-1).squeeze(0)
-                anchor_scores = self._normalize_scores(torch.clamp(projected_patches @ anchor_layer, min=-1.0, max=1.0))
-                score_terms.append(anchor_scores)
-                anchor_used = True
-
-        if len(score_terms) == 0:
-            return None, anchor_used
-
-        stacked_scores = torch.stack(score_terms, dim=0)
-        return torch.nan_to_num(stacked_scores.mean(dim=0), nan=0.0, posinf=0.0, neginf=0.0), anchor_used
-
-    def _maybe_condense_tokens(
-        self,
-        x: torch.Tensor,
-        attn_weights: Optional[torch.Tensor],
-        layer_idx: int,
-        token_condense_config: Dict[str, Any],
-        stats: Dict[str, Any],
-    ):
-        selected_layers = token_condense_config.get("selected_layers", set())
-        if layer_idx not in selected_layers or x.size(1) != 1:
-            return x
-
-        patch_count = x.size(0) - 1
-        min_tokens = int(token_condense_config.get("min_keep_tokens", 16))
-        keep_ratio = float(token_condense_config.get("keep_ratio", 0.6))
-        keep_count = max(min_tokens, int(round(patch_count * keep_ratio)))
-        keep_count = min(max(1, keep_count), patch_count)
-
-        stats["attempted"] += 1
-        stats["attempted_layers"].append(layer_idx)
-        if keep_count >= patch_count:
-            stats["fallback_count"] += 1
-            return x
-
-        token_scores, anchor_used = self._compute_condensation_scores(x, attn_weights, layer_idx, token_condense_config)
-        if token_scores is None or not torch.isfinite(token_scores).all():
-            stats["fallback_count"] += 1
-            return x
-
-        stats["anchor_guided_layers"] += 1 if anchor_used else 0
-        keep_patch_indices = torch.topk(token_scores, k=keep_count, dim=0).indices + 1
-        keep_patch_indices = keep_patch_indices.sort().values
-        keep_indices = torch.cat([
-            torch.zeros(1, device=x.device, dtype=torch.long),
-            keep_patch_indices.to(x.device, dtype=torch.long),
-        ], dim=0)
-
-        stats["applied"] += 1
-        stats["applied_layers"].append(layer_idx)
-        stats["kept_token_counts"].append(int(keep_count))
-        stats["keep_ratios"].append(float(keep_count) / float(max(1, patch_count)))
-        return x.index_select(0, keep_indices)
+    def update_cls_token_cache(self, cls_token_cache: Optional[torch.Tensor]):
+        self.cls_token_cache = cls_token_cache
 
     def forward(
         self,
@@ -352,8 +389,10 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        condense_enabled = token_condense_config is not None and token_condense_config.get("enabled", False)
-        selected_layers = set(token_condense_config.get("selected_layers", [])) if condense_enabled else set()
+        condense_mode = None if token_condense_config is None else token_condense_config.get("mode")
+        condense_enabled = condense_mode == "tca-ours"
+        drop_rate = float(token_condense_config.get("drop_rate", 0.0)) if condense_enabled else 0.0
+        drop_locations = set(token_condense_config.get("drop_locations", [3, 6, 9])) if condense_enabled else set()
         condense_stats = {
             "enabled": condense_enabled,
             "attempted": 0,
@@ -361,36 +400,59 @@ class VisionTransformer(nn.Module):
             "attempted_layers": [],
             "applied_layers": [],
             "kept_token_counts": [],
-            "keep_ratios": [],
+            "merged_token_counts": [],
+            "extra_token_counts": [],
             "fallback_count": 0,
-            "anchor_guided_layers": 0,
         }
+        hidden_cls_tokens = []
         if return_layer_cls:
             layer_cls_tokens = []
             for layer_idx, block in enumerate(self.transformer.resblocks):
-                return_attention = condense_enabled and layer_idx in selected_layers and x.size(1) == 1
-                if return_attention:
-                    x, attn_weights = block(x, return_attention=True)
-                    x = self._maybe_condense_tokens(x, attn_weights, layer_idx, {
-                        **token_condense_config,
-                        "selected_layers": selected_layers,
-                    }, condense_stats)
+                if condense_enabled:
+                    apply_drop = drop_rate if layer_idx in drop_locations else 0.0
+                    x, block_stats = block.forward_tca(
+                        x,
+                        drop_rate=apply_drop,
+                        cls_token_cache=self.cls_token_cache,
+                        layer_idx=layer_idx,
+                    )
+                    if layer_idx in drop_locations:
+                        condense_stats["attempted"] += 1
+                        condense_stats["attempted_layers"].append(layer_idx)
+                    if block_stats["applied"]:
+                        condense_stats["applied"] += 1
+                        condense_stats["applied_layers"].append(layer_idx)
+                        condense_stats["kept_token_counts"].append(block_stats["kept_tokens"])
+                        condense_stats["merged_token_counts"].append(block_stats["merged_tokens"])
+                        condense_stats["extra_token_counts"].append(block_stats["extra_tokens"])
                 else:
                     x = block(x)
-                layer_cls = x[0]
-                layer_cls = self.ln_post(layer_cls)
+                hidden_cls = x[0]
+                hidden_cls_tokens.append(hidden_cls)
+                projected_cls = self.ln_post(hidden_cls)
                 if self.proj is not None:
-                    layer_cls = layer_cls @ self.proj
-                layer_cls_tokens.append(layer_cls)
+                    projected_cls = projected_cls @ self.proj
+                layer_cls_tokens.append(projected_cls)
         else:
             for layer_idx, block in enumerate(self.transformer.resblocks):
-                return_attention = condense_enabled and layer_idx in selected_layers and x.size(1) == 1
-                if return_attention:
-                    x, attn_weights = block(x, return_attention=True)
-                    x = self._maybe_condense_tokens(x, attn_weights, layer_idx, {
-                        **token_condense_config,
-                        "selected_layers": selected_layers,
-                    }, condense_stats)
+                if condense_enabled:
+                    apply_drop = drop_rate if layer_idx in drop_locations else 0.0
+                    x, block_stats = block.forward_tca(
+                        x,
+                        drop_rate=apply_drop,
+                        cls_token_cache=self.cls_token_cache,
+                        layer_idx=layer_idx,
+                    )
+                    hidden_cls_tokens.append(x[0])
+                    if layer_idx in drop_locations:
+                        condense_stats["attempted"] += 1
+                        condense_stats["attempted_layers"].append(layer_idx)
+                    if block_stats["applied"]:
+                        condense_stats["applied"] += 1
+                        condense_stats["applied_layers"].append(layer_idx)
+                        condense_stats["kept_token_counts"].append(block_stats["kept_tokens"])
+                        condense_stats["merged_token_counts"].append(block_stats["merged_tokens"])
+                        condense_stats["extra_token_counts"].append(block_stats["extra_tokens"])
                 else:
                     x = block(x)
         final_sequence_length = int(x.shape[0])
@@ -413,6 +475,8 @@ class VisionTransformer(nn.Module):
             }
             if return_layer_cls:
                 result["layer_cls_tokens"] = torch.stack(layer_cls_tokens, dim=1)
+            if len(hidden_cls_tokens) > 0:
+                result["hidden_cls_tokens"] = torch.stack(hidden_cls_tokens, dim=1)
             return result
 
         if return_layer_cls:
@@ -527,6 +591,10 @@ class CLIP(nn.Module):
             if return_layer_cls or (token_condense_config is not None and token_condense_config.get("enabled", False)):
                 return self.visual(image, return_layer_cls=return_layer_cls, token_condense_config=token_condense_config)
         return self.visual(image)
+
+    def update_tca_cls_token_cache(self, cls_token_cache: Optional[torch.Tensor]):
+        if isinstance(self.visual, VisionTransformer):
+            self.visual.update_cls_token_cache(cls_token_cache)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]

@@ -145,10 +145,12 @@ def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, 
         if isinstance(model_outputs, dict):
             raw_image_features = model_outputs["image_features"]
             layer_cls_tokens = model_outputs.get("layer_cls_tokens")
+            hidden_cls_tokens = model_outputs.get("hidden_cls_tokens")
             token_condense_details = model_outputs.get("token_condense")
         else:
             raw_image_features = model_outputs
             layer_cls_tokens = None
+            hidden_cls_tokens = None
             token_condense_details = None
 
         image_features = raw_image_features / raw_image_features.norm(dim=-1, keepdim=True)
@@ -175,6 +177,7 @@ def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, 
 
         details = {
             'layer_cls_tokens': selected_layer_cls,
+            'hidden_cls_tokens': hidden_cls_tokens,
             'supports_anchor': selected_layer_cls is not None,
             'token_condense': token_condense_details,
         }

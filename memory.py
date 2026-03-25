@@ -623,3 +623,139 @@ class AnchorReservoir:
                 tokens = item[0]
                 total_bytes += tokens.element_size() * tokens.nelement()
         return total_bytes
+
+
+class TCAReservoirMemory:
+    def __init__(
+        self,
+        num_classes,
+        capacity,
+        device,
+        num_layers,
+        token_sim=True,
+        diverse_cache=True,
+    ):
+        self.num_classes = num_classes
+        self.capacity = capacity
+        self.device = device
+        self.num_layers = num_layers
+        self.token_sim = token_sim
+        self.diverse_cache = diverse_cache
+        self.reservoir = {class_idx: [] for class_idx in range(num_classes)}
+        self.total_updates_seen = 0
+        self.accepted_updates = 0
+
+    def is_empty(self):
+        return all(len(items) == 0 for items in self.reservoir.values())
+
+    def _item_similarity(self, item_a, item_b):
+        if self.token_sim:
+            feat_a = torch.mean(item_a[2], dim=0)
+            feat_b = torch.mean(item_b[2], dim=0)
+        else:
+            feat_a = item_a[0].squeeze(0)
+            feat_b = item_b[0].squeeze(0)
+        return float(F.cosine_similarity(feat_a.unsqueeze(0), feat_b.unsqueeze(0), dim=-1).item())
+
+    def _similarity_scores(self, items):
+        if len(items) <= 1:
+            return [0.0 for _ in items]
+        scores = []
+        for i, item in enumerate(items):
+            sims = []
+            for j, other in enumerate(items):
+                if i == j:
+                    continue
+                sims.append(self._item_similarity(item, other))
+            scores.append(sum(sims) / max(1, len(sims)))
+        return scores
+
+    def update(self, pred, image_feature, loss, hidden_cls_tokens):
+        self.total_updates_seen += 1
+        if hidden_cls_tokens is None or self.capacity <= 0:
+            return False
+
+        pred = int(pred)
+        feature = image_feature.detach().float()
+        cls_tokens = hidden_cls_tokens.squeeze(0).detach().float()
+        cls_tokens = F.normalize(cls_tokens, dim=-1)
+        item = [feature, float(loss), cls_tokens]
+
+        class_items = self.reservoir[pred]
+        class_items.append(item)
+        if len(class_items) > self.capacity:
+            sim_scores = self._similarity_scores(class_items)
+            losses = [entry[1] for entry in class_items]
+            if self.diverse_cache:
+                combined_scores = [losses[idx] + sim_scores[idx] for idx in range(len(class_items))]
+            else:
+                combined_scores = [losses[idx] + (1.0 - sim_scores[idx]) for idx in range(len(class_items))]
+            drop_idx = int(torch.argmax(torch.tensor(combined_scores)).item())
+            class_items.pop(drop_idx)
+
+        class_items.sort(key=operator.itemgetter(1))
+        self.accepted_updates += 1
+        return True
+
+    def cls_token_cache(self):
+        mean_tensors = []
+        for class_idx in range(self.num_classes):
+            items = self.reservoir[class_idx]
+            if len(items) == 0:
+                continue
+            mean_tensors.append(torch.mean(torch.stack([item[2] for item in items], dim=0), dim=0))
+        if len(mean_tensors) == 0:
+            return None
+        return torch.stack(mean_tensors, dim=0).to(self.device)
+
+    def logits(self, hidden_cls_tokens, scale, lambd, beta, clip_weights):
+        if hidden_cls_tokens is None or self.is_empty():
+            return torch.zeros(1, self.num_classes, device=self.device, dtype=torch.float32)
+
+        if self.num_layers <= 0:
+            scaling_weights = torch.ones(1, device=self.device, dtype=torch.float32)
+        else:
+            scaling_weights = torch.exp(torch.linspace(0, 1, self.num_layers, device=self.device, dtype=torch.float32) / max(scale, 1e-6))
+            scaling_weights = scaling_weights / scaling_weights.sum().clamp_min(1e-6)
+
+        reservoir_token_keys = []
+        reservoir_values = []
+        for class_index in sorted(self.reservoir.keys()):
+            for item in self.reservoir[class_index]:
+                reservoir_token_keys.append(item[2].unsqueeze(0))
+                reservoir_values.append(class_index)
+
+        if len(reservoir_token_keys) == 0:
+            return torch.zeros(1, self.num_classes, device=self.device, dtype=torch.float32)
+
+        reservoir_token_keys = torch.cat(reservoir_token_keys, dim=0).to(self.device)
+        reservoir_values = F.one_hot(
+            torch.tensor(reservoir_values, dtype=torch.int64, device=self.device),
+            num_classes=clip_weights.size(1),
+        ).float()
+
+        query = hidden_cls_tokens.squeeze(0).float().to(self.device)
+        affinity_token = (
+            F.cosine_similarity(query.unsqueeze(0), reservoir_token_keys, dim=-1) * scaling_weights.unsqueeze(0)
+        ).sum(dim=1, keepdim=True)
+        affinity = affinity_token.permute(1, 0)
+        reservoir_logits = ((-1.0) * (beta - beta * affinity)).exp() @ reservoir_values
+        return lambd * reservoir_logits
+
+    def stats(self):
+        total_items = sum(len(items) for items in self.reservoir.values())
+        fill_ratio = float(total_items) / float(max(1, self.num_classes * self.capacity))
+        return {
+            'accepted_updates': int(self.accepted_updates),
+            'total_update_attempts': int(self.total_updates_seen),
+            'accept_rate': float(self.accepted_updates / self.total_updates_seen) if self.total_updates_seen > 0 else 0.0,
+            'fill_ratio': fill_ratio,
+        }
+
+    def memory_bytes(self):
+        total_bytes = 0
+        for class_items in self.reservoir.values():
+            for item in class_items:
+                total_bytes += item[0].element_size() * item[0].nelement()
+                total_bytes += item[2].element_size() * item[2].nelement()
+        return total_bytes
