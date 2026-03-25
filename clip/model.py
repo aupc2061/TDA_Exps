@@ -265,14 +265,22 @@ class ResidualAttentionBlock(nn.Module):
     ):
         n_tokens, batch_size, channels = x.shape
 
+        layer_cls_cache = None
+        if cls_token_cache is not None:
+            cls_token_cache = cls_token_cache.to(device=x.device, dtype=x.dtype)
+            if cls_token_cache.dim() == 3 and layer_idx is not None:
+                cache_layer_idx = max(0, min(int(layer_idx) - 1, cls_token_cache.size(1) - 1))
+                layer_cls_cache = cls_token_cache[:, cache_layer_idx, :]
+            elif cls_token_cache.dim() == 2:
+                layer_cls_cache = cls_token_cache
+
         if drop_rate <= 0.0:
-            if cls_token_cache is not None and layer_idx in [3, 6, 9]:
-                cls_token_cache = cls_token_cache.to(device=x.device, dtype=x.dtype)
+            if layer_cls_cache is not None and layer_idx in [3, 6, 9]:
                 max_token_cls = torch.argmax(
-                    F.cosine_similarity(cls_token_cache.unsqueeze(1), x[:1, :, :], dim=2),
+                    F.cosine_similarity(layer_cls_cache.unsqueeze(1), x[:1, :, :], dim=2),
                     dim=0,
                 )
-                attn_input = torch.cat((cls_token_cache[max_token_cls].unsqueeze(0), x), dim=0)
+                attn_input = torch.cat((layer_cls_cache[max_token_cls].unsqueeze(0), x), dim=0)
                 tmp, attn_weights = self.attention(self.ln_1(attn_input), return_weights=True)
                 x = x + tmp[1:, :, :]
             else:
@@ -288,14 +296,12 @@ class ResidualAttentionBlock(nn.Module):
         left_tokens = math.ceil((1.0 - drop_rate) * (n_tokens - 1))
         left_tokens = max(1, min(left_tokens, n_tokens - 1))
         merged_tokens_count = max(1, n_tokens - left_tokens)
-
-        if cls_token_cache is not None:
-            cls_token_cache = cls_token_cache.to(device=x.device, dtype=x.dtype)
+        if layer_cls_cache is not None:
             max_token_cls = torch.argmax(
-                F.cosine_similarity(cls_token_cache.unsqueeze(1), x[:1, :, :], dim=2),
+                F.cosine_similarity(layer_cls_cache.unsqueeze(1), x[:1, :, :], dim=2),
                 dim=0,
             )
-            attn_input = torch.cat((cls_token_cache[max_token_cls].unsqueeze(0), x), dim=0)
+            attn_input = torch.cat((layer_cls_cache[max_token_cls].unsqueeze(0), x), dim=0)
             tmp, attn_weights = self.attention(self.ln_1(attn_input), return_weights=True)
             tmp = tmp[1:, :, :]
             attn_weights = attn_weights[:, :, 1:, 1:]
