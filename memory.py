@@ -587,6 +587,18 @@ class AnchorReservoir:
 
         return alpha * class_scores.unsqueeze(0)
 
+    def get_class_anchor(self, class_idx):
+        class_idx = int(class_idx)
+        items = self.reservoir.get(class_idx, [])
+        if len(items) == 0:
+            return None
+
+        tokens = items[0][0]
+        if not self._is_finite_tensor(tokens):
+            self.invalid_anchor_rejections += 1
+            return None
+        return torch.nan_to_num(tokens.detach().clone().float(), nan=0.0, posinf=0.0, neginf=0.0)
+
     def fill_ratio(self):
         if self.capacity <= 0 or self.num_classes <= 0:
             return 0.0

@@ -127,7 +127,7 @@ def get_clip_logits(images, clip_model, clip_weights, device=None):
         return image_features, clip_logits, loss, prob_map, pred
 
 
-def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, return_layer_cls=False):
+def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, return_layer_cls=False, token_condense_config=None):
     if device is None:
         device = next(clip_model.parameters()).device
 
@@ -137,13 +137,19 @@ def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, 
         else:
             images = images.to(device)
 
-        model_outputs = clip_model.encode_image(images, return_layer_cls=return_layer_cls)
+        model_outputs = clip_model.encode_image(
+            images,
+            return_layer_cls=return_layer_cls,
+            token_condense_config=token_condense_config,
+        )
         if isinstance(model_outputs, dict):
             raw_image_features = model_outputs["image_features"]
             layer_cls_tokens = model_outputs.get("layer_cls_tokens")
+            token_condense_details = model_outputs.get("token_condense")
         else:
             raw_image_features = model_outputs
             layer_cls_tokens = None
+            token_condense_details = None
 
         image_features = raw_image_features / raw_image_features.norm(dim=-1, keepdim=True)
         clip_logits = 100. * image_features @ clip_weights
@@ -170,6 +176,7 @@ def get_clip_logits_with_details(images, clip_model, clip_weights, device=None, 
         details = {
             'layer_cls_tokens': selected_layer_cls,
             'supports_anchor': selected_layer_cls is not None,
+            'token_condense': token_condense_details,
         }
 
         return image_features, clip_logits, loss, prob_map, pred, details

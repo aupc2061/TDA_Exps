@@ -8,6 +8,7 @@ import importlib
 import torch
 
 import clip
+from clip.model import VisionTransformer
 from utils import *
 from memory import AnchorReservoir, CacheMemory, Mamba3Memory, SSMemory
 
@@ -47,6 +48,15 @@ def get_arguments():
     parser.add_argument('--anchor-entropy-threshold', dest='anchor_entropy_threshold', type=float, default=0.25, help='Maximum normalized entropy for adding a sample to the anchor reservoir.')
     parser.add_argument('--anchor-alpha', dest='anchor_alpha', type=float, default=0.6, help='Strength of anchor-based logit correction.')
     parser.add_argument('--anchor-beta', dest='anchor_beta', type=float, default=1.5, help='Layer weighting temperature for anchor-based logit correction.')
+    parser.add_argument('--enable-token-condensation', dest='enable_token_condensation', action='store_true', help='Enable uncertainty-triggered token condensation for ViT backbones.')
+    parser.add_argument('--token-condense-backbone', dest='token_condense_backbone', type=str, choices=['vit-only'], default='vit-only', help='Backbone scope for token condensation. Default: vit-only.')
+    parser.add_argument('--token-condense-entropy-threshold', dest='token_condense_entropy_threshold', type=float, default=0.25, help='Minimum normalized entropy needed to trigger token condensation.')
+    parser.add_argument('--token-condense-margin-threshold', dest='token_condense_margin_threshold', type=float, default=0.20, help='Maximum top-1/top-2 margin to trigger token condensation.')
+    parser.add_argument('--token-condense-consensus-threshold', dest='token_condense_consensus_threshold', type=float, default=0.50, help='Consensus confidence threshold below which token condensation can trigger.')
+    parser.add_argument('--token-condense-layers', dest='token_condense_layers', type=str, default='8,9,10,11', help='Comma-separated ViT layer indices where token pruning may be applied.')
+    parser.add_argument('--token-keep-ratio', dest='token_keep_ratio', type=float, default=0.6, help='Fraction of patch tokens to keep when token condensation is applied.')
+    parser.add_argument('--token-merge-ratio', dest='token_merge_ratio', type=float, default=0.0, help='Reserved for later token merging support. Currently logged but unused.')
+    parser.add_argument('--token-condense-max-samples-debug', dest='token_condense_max_samples_debug', type=int, default=None, help='Optional cap on the number of condensed samples for debugging.')
     parser.add_argument('--mamba3-mode', dest='mamba3_mode', type=str, choices=['mamba3-trapezoid', 'mamba3-complex', 'mamba3-multislot'], default='mamba3-trapezoid', help='Mamba-3-inspired memory variant.')
     parser.add_argument('--mamba3-min-blend', dest='mamba3_min_blend', type=float, default=0.02, help='Minimum selective blend factor for Mamba-3-inspired memory.')
     parser.add_argument('--mamba3-max-blend', dest='mamba3_max_blend', type=float, default=0.35, help='Maximum selective blend factor for Mamba-3-inspired memory.')
@@ -141,6 +151,35 @@ def _get_peak_device_memory(device):
     return 0, 'peak_device_memory_mb'
 
 
+def _top1_top2_margin_from_logits(logits):
+    probs = logits.softmax(dim=1)
+    if probs.size(1) < 2:
+        return 1.0
+    top2 = probs.topk(k=2, dim=1).values
+    return float((top2[:, 0] - top2[:, 1]).mean().item())
+
+
+def _parse_token_condense_layers(layers):
+    if layers is None:
+        return []
+    if isinstance(layers, str):
+        return [int(x.strip()) for x in layers.split(',') if x.strip()]
+    return [int(x) for x in layers]
+
+
+def _should_trigger_token_condensation(prop_entropy, margin, consensus_stats, token_condense_kwargs):
+    if token_condense_kwargs is None or not token_condense_kwargs.get('enabled', False):
+        return False
+
+    if prop_entropy >= token_condense_kwargs['entropy_threshold']:
+        return True
+    if margin <= token_condense_kwargs['margin_threshold']:
+        return True
+    if consensus_stats is not None and consensus_stats.get('soft_score', 1.0) <= token_condense_kwargs['consensus_threshold']:
+        return True
+    return False
+
+
 def run_test_tda(
     pos_cfg,
     neg_cfg,
@@ -155,6 +194,7 @@ def run_test_tda(
     ssm_kwargs=None,
     consensus_kwargs=None,
     anchor_kwargs=None,
+    token_condense_kwargs=None,
 ):
     device = next(clip_model.parameters()).device
     use_consensus = consensus_kwargs is not None and consensus_kwargs.get('n_views', 0) > 0
@@ -182,6 +222,12 @@ def run_test_tda(
         anchor_correction_active_history = []
         anchor_correction_norm_history = []
         anchor_correction_skip_count = 0
+        token_condense_attempt_history = []
+        token_condense_apply_history = []
+        token_condense_keep_ratio_history = []
+        token_condense_kept_tokens_history = []
+        token_condense_layer_history = []
+        token_condense_fallback_history = []
         if device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -190,6 +236,11 @@ def run_test_tda(
         #Unpack all hyperparameters
         pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
         anchor_enabled = anchor_kwargs is not None and anchor_kwargs.get('enabled', False)
+        token_condense_enabled = (
+            token_condense_kwargs is not None
+            and token_condense_kwargs.get('enabled', False)
+            and isinstance(getattr(clip_model, 'visual', None), VisionTransformer)
+        )
         if pos_enabled:
             pos_params = {k: pos_cfg[k] for k in ['shot_capacity', 'alpha', 'beta']}
         if neg_enabled:
@@ -203,6 +254,7 @@ def run_test_tda(
             _sync_device(device)
             step_start = time.perf_counter()
 
+            visual_details = {}
             if use_consensus:
                 if dynamic_view_budget:
                     image_features, clip_logits, loss, prob_map, pred, consensus_stats, visual_details = \
@@ -240,6 +292,44 @@ def run_test_tda(
                 consensus_stats = None
 
             target, prop_entropy = target.to(device), get_entropy(loss, clip_weights)
+            initial_margin = _top1_top2_margin_from_logits(clip_logits)
+
+            token_condense_details = None
+            token_condense_applied = False
+            if token_condense_enabled and not use_consensus:
+                token_condense_debug_cap = token_condense_kwargs.get('max_samples_debug')
+                allow_debug = token_condense_debug_cap is None or sum(token_condense_attempt_history) < int(token_condense_debug_cap)
+                if allow_debug and _should_trigger_token_condensation(prop_entropy, initial_margin, consensus_stats, token_condense_kwargs):
+                    anchor_tokens = None
+                    if anchor_memory is not None and not anchor_memory.is_empty():
+                        anchor_tokens = anchor_memory.get_class_anchor(pred)
+
+                    condense_config = {
+                        'enabled': True,
+                        'selected_layers': token_condense_kwargs['layers'],
+                        'keep_ratio': token_condense_kwargs['keep_ratio'],
+                        'merge_ratio': token_condense_kwargs['merge_ratio'],
+                        'min_keep_tokens': token_condense_kwargs['min_keep_tokens'],
+                        'anchor_tokens': anchor_tokens,
+                    }
+                    image_features_tc, clip_logits_tc, loss_tc, prob_map_tc, pred_tc, visual_details_tc = get_clip_logits_with_details(
+                        images,
+                        clip_model,
+                        clip_weights,
+                        device=device,
+                        return_layer_cls=anchor_enabled,
+                        token_condense_config=condense_config,
+                    )
+                    token_condense_details = visual_details_tc.get('token_condense')
+                    if token_condense_details is not None and token_condense_details.get('applied_any', False):
+                        image_features = image_features_tc
+                        clip_logits = clip_logits_tc
+                        loss = loss_tc
+                        prob_map = prob_map_tc
+                        pred = pred_tc
+                        visual_details = visual_details_tc
+                        prop_entropy = get_entropy(loss, clip_weights)
+                        token_condense_applied = True
 
             if pos_enabled and pos_memory is None:
                 pos_memory = _build_memory(memory_type, pos_params, clip_weights, image_features, include_prob_map=False, ssm_kwargs=ssm_kwargs)
@@ -309,6 +399,23 @@ def run_test_tda(
             anchor_correction_norm_history.append(
                 float(anchor_correction.norm().item()) if anchor_correction is not None else 0.0
             )
+            if token_condense_details is None:
+                token_condense_attempt_history.append(0.0)
+                token_condense_apply_history.append(0.0)
+                token_condense_keep_ratio_history.append(0.0)
+                token_condense_kept_tokens_history.append(0.0)
+                token_condense_layer_history.append(0.0)
+                token_condense_fallback_history.append(0.0)
+            else:
+                token_condense_attempt_history.append(1.0 if token_condense_details.get('active', False) else 0.0)
+                token_condense_apply_history.append(1.0 if token_condense_applied else 0.0)
+                keep_ratios = token_condense_details.get('keep_ratios', [])
+                kept_counts = token_condense_details.get('kept_token_counts', [])
+                applied_layers = token_condense_details.get('applied_layers', [])
+                token_condense_keep_ratio_history.append(float(np.mean(keep_ratios)) if len(keep_ratios) > 0 else 0.0)
+                token_condense_kept_tokens_history.append(float(np.mean(kept_counts)) if len(kept_counts) > 0 else 0.0)
+                token_condense_layer_history.append(float(len(applied_layers)))
+                token_condense_fallback_history.append(float(token_condense_details.get('fallback_count', 0)))
 
                 
             acc = cls_acc(final_logits, target)  
@@ -398,6 +505,24 @@ def run_test_tda(
                 details['anchor_fill_ratio_curve'] = (anchor_fill_prefix / anchor_steps).tolist()
                 details['anchor_correction_active_rate_curve'] = (anchor_active_prefix / anchor_steps).tolist()
                 details['anchor_correction_norm_curve'] = (anchor_norm_prefix / anchor_steps).tolist()
+        if len(token_condense_attempt_history) > 0:
+            tc_attempt_prefix = np.cumsum(np.array(token_condense_attempt_history, dtype=np.float64))
+            tc_apply_prefix = np.cumsum(np.array(token_condense_apply_history, dtype=np.float64))
+            tc_keep_ratio_prefix = np.cumsum(np.array(token_condense_keep_ratio_history, dtype=np.float64))
+            tc_kept_tokens_prefix = np.cumsum(np.array(token_condense_kept_tokens_history, dtype=np.float64))
+            tc_layer_prefix = np.cumsum(np.array(token_condense_layer_history, dtype=np.float64))
+            tc_fallback_prefix = np.cumsum(np.array(token_condense_fallback_history, dtype=np.float64))
+            tc_steps = np.arange(1, len(token_condense_attempt_history) + 1, dtype=np.float64)
+            details['token_condense_attempt_count'] = int(np.sum(token_condense_attempt_history))
+            details['token_condense_apply_count'] = int(np.sum(token_condense_apply_history))
+            details['token_condense_attempt_rate'] = float(tc_attempt_prefix[-1] / tc_steps[-1])
+            details['token_condense_apply_rate'] = float(tc_apply_prefix[-1] / tc_steps[-1])
+            details['avg_token_condense_keep_ratio'] = float(tc_keep_ratio_prefix[-1] / tc_steps[-1])
+            details['avg_token_condense_kept_tokens'] = float(tc_kept_tokens_prefix[-1] / tc_steps[-1])
+            details['avg_token_condense_layers'] = float(tc_layer_prefix[-1] / tc_steps[-1])
+            details['avg_token_condense_fallbacks'] = float(tc_fallback_prefix[-1] / tc_steps[-1])
+            details['token_condense_attempt_rate_curve'] = (tc_attempt_prefix / tc_steps).tolist()
+            details['token_condense_apply_rate_curve'] = (tc_apply_prefix / tc_steps).tolist()
         if memory_type == 'ssm-mamba3' and pos_memory is not None:
             mamba3_stats = pos_memory.stats()
             details['mamba3_update_accept_count'] = mamba3_stats['accepted_updates']
@@ -460,6 +585,18 @@ def main():
         'alpha': args.anchor_alpha,
         'beta': args.anchor_beta,
     }
+    token_condense_kwargs = {
+        'enabled': args.enable_token_condensation,
+        'backbone_scope': args.token_condense_backbone,
+        'entropy_threshold': args.token_condense_entropy_threshold,
+        'margin_threshold': args.token_condense_margin_threshold,
+        'consensus_threshold': args.token_condense_consensus_threshold,
+        'layers': _parse_token_condense_layers(args.token_condense_layers),
+        'keep_ratio': args.token_keep_ratio,
+        'merge_ratio': args.token_merge_ratio,
+        'max_samples_debug': args.token_condense_max_samples_debug,
+        'min_keep_tokens': 16,
+    }
 
     consensus_kwargs = None
     if args.n_views > 0:
@@ -512,6 +649,7 @@ def main():
             ssm_kwargs=ssm_kwargs,
             consensus_kwargs=consensus_kwargs,
             anchor_kwargs=anchor_kwargs,
+            token_condense_kwargs=token_condense_kwargs,
         )
 
         if args.wandb:

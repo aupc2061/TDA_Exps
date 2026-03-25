@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -178,13 +178,32 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-    def attention(self, x: torch.Tensor):
+    def attention(self, x: torch.Tensor, return_weights: bool = False):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        if not return_weights:
+            return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0], None
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
+        try:
+            attn_out, attn_weights = self.attn(
+                x,
+                x,
+                x,
+                need_weights=True,
+                average_attn_weights=False,
+                attn_mask=self.attn_mask,
+            )
+        except TypeError:
+            attn_out, attn_weights = self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
+            if attn_weights is not None and attn_weights.dim() == 3:
+                attn_weights = attn_weights.unsqueeze(1)
+        return attn_out, attn_weights
+
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
+        attn_out, attn_weights = self.attention(self.ln_1(x), return_weights=return_attention)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
+        if return_attention:
+            return x, attn_weights
         return x
 
 
@@ -216,7 +235,115 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, return_layer_cls: bool = False):
+    def _normalize_scores(self, scores: torch.Tensor):
+        scores = torch.nan_to_num(scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if scores.numel() == 0:
+            return scores
+        score_min = scores.min()
+        score_max = scores.max()
+        if float((score_max - score_min).abs().item()) < 1e-6:
+            return torch.ones_like(scores)
+        return (scores - score_min) / (score_max - score_min).clamp_min(1e-6)
+
+    def _project_tokens(self, tokens: torch.Tensor):
+        projected = self.ln_post(tokens)
+        if self.proj is not None:
+            projected = projected @ self.proj
+        return projected
+
+    def _compute_condensation_scores(
+        self,
+        x: torch.Tensor,
+        attn_weights: Optional[torch.Tensor],
+        layer_idx: int,
+        token_condense_config: Dict[str, Any],
+    ):
+        if x.size(1) != 1 or x.size(0) <= 2:
+            return None, False
+
+        patch_tokens = x[1:, 0, :].float()
+        if patch_tokens.size(0) == 0:
+            return None, False
+
+        score_terms = []
+        if attn_weights is not None and attn_weights.dim() == 4 and attn_weights.size(-1) == x.size(0):
+            cls_attn = torch.nan_to_num(attn_weights[0, :, 0, 1:].float(), nan=0.0, posinf=0.0, neginf=0.0)
+            attn_mean = self._normalize_scores(cls_attn.mean(dim=0))
+            agreement = self._normalize_scores(1.0 / (1.0 + cls_attn.std(dim=0, unbiased=False)))
+            score_terms.extend([attn_mean, agreement])
+
+        anchor_tokens = token_condense_config.get("anchor_tokens")
+        anchor_used = False
+        if anchor_tokens is not None and layer_idx < anchor_tokens.size(0):
+            anchor_layer = torch.nan_to_num(
+                anchor_tokens[layer_idx].to(device=patch_tokens.device, dtype=torch.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            if torch.isfinite(anchor_layer).all() and float(anchor_layer.norm().item()) > 0.0:
+                projected_patches = self._project_tokens(patch_tokens)
+                projected_patches = F.normalize(projected_patches.float(), dim=-1)
+                anchor_layer = F.normalize(anchor_layer.unsqueeze(0), dim=-1).squeeze(0)
+                anchor_scores = self._normalize_scores(torch.clamp(projected_patches @ anchor_layer, min=-1.0, max=1.0))
+                score_terms.append(anchor_scores)
+                anchor_used = True
+
+        if len(score_terms) == 0:
+            return None, anchor_used
+
+        stacked_scores = torch.stack(score_terms, dim=0)
+        return torch.nan_to_num(stacked_scores.mean(dim=0), nan=0.0, posinf=0.0, neginf=0.0), anchor_used
+
+    def _maybe_condense_tokens(
+        self,
+        x: torch.Tensor,
+        attn_weights: Optional[torch.Tensor],
+        layer_idx: int,
+        token_condense_config: Dict[str, Any],
+        stats: Dict[str, Any],
+    ):
+        selected_layers = token_condense_config.get("selected_layers", set())
+        if layer_idx not in selected_layers or x.size(1) != 1:
+            return x
+
+        patch_count = x.size(0) - 1
+        min_tokens = int(token_condense_config.get("min_keep_tokens", 16))
+        keep_ratio = float(token_condense_config.get("keep_ratio", 0.6))
+        keep_count = max(min_tokens, int(round(patch_count * keep_ratio)))
+        keep_count = min(max(1, keep_count), patch_count)
+
+        stats["attempted"] += 1
+        stats["attempted_layers"].append(layer_idx)
+        if keep_count >= patch_count:
+            stats["fallback_count"] += 1
+            return x
+
+        token_scores, anchor_used = self._compute_condensation_scores(x, attn_weights, layer_idx, token_condense_config)
+        if token_scores is None or not torch.isfinite(token_scores).all():
+            stats["fallback_count"] += 1
+            return x
+
+        stats["anchor_guided_layers"] += 1 if anchor_used else 0
+        keep_patch_indices = torch.topk(token_scores, k=keep_count, dim=0).indices + 1
+        keep_patch_indices = keep_patch_indices.sort().values
+        keep_indices = torch.cat([
+            torch.zeros(1, device=x.device, dtype=torch.long),
+            keep_patch_indices.to(x.device, dtype=torch.long),
+        ], dim=0)
+
+        stats["applied"] += 1
+        stats["applied_layers"].append(layer_idx)
+        stats["kept_token_counts"].append(int(keep_count))
+        stats["keep_ratios"].append(float(keep_count) / float(max(1, patch_count)))
+        return x.index_select(0, keep_indices)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_layer_cls: bool = False,
+        token_condense_config: Optional[Dict[str, Any]] = None,
+    ):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -225,23 +352,68 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
+        condense_enabled = token_condense_config is not None and token_condense_config.get("enabled", False)
+        selected_layers = set(token_condense_config.get("selected_layers", [])) if condense_enabled else set()
+        condense_stats = {
+            "enabled": condense_enabled,
+            "attempted": 0,
+            "applied": 0,
+            "attempted_layers": [],
+            "applied_layers": [],
+            "kept_token_counts": [],
+            "keep_ratios": [],
+            "fallback_count": 0,
+            "anchor_guided_layers": 0,
+        }
         if return_layer_cls:
             layer_cls_tokens = []
-            for block in self.transformer.resblocks:
-                x = block(x)
+            for layer_idx, block in enumerate(self.transformer.resblocks):
+                return_attention = condense_enabled and layer_idx in selected_layers and x.size(1) == 1
+                if return_attention:
+                    x, attn_weights = block(x, return_attention=True)
+                    x = self._maybe_condense_tokens(x, attn_weights, layer_idx, {
+                        **token_condense_config,
+                        "selected_layers": selected_layers,
+                    }, condense_stats)
+                else:
+                    x = block(x)
                 layer_cls = x[0]
                 layer_cls = self.ln_post(layer_cls)
                 if self.proj is not None:
                     layer_cls = layer_cls @ self.proj
                 layer_cls_tokens.append(layer_cls)
         else:
-            x = self.transformer(x)
+            for layer_idx, block in enumerate(self.transformer.resblocks):
+                return_attention = condense_enabled and layer_idx in selected_layers and x.size(1) == 1
+                if return_attention:
+                    x, attn_weights = block(x, return_attention=True)
+                    x = self._maybe_condense_tokens(x, attn_weights, layer_idx, {
+                        **token_condense_config,
+                        "selected_layers": selected_layers,
+                    }, condense_stats)
+                else:
+                    x = block(x)
+        final_sequence_length = int(x.shape[0])
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
 
         if self.proj is not None:
             x = x @ self.proj
+
+        if return_layer_cls or condense_enabled:
+            result = {
+                "image_features": x,
+                "token_condense": {
+                    **condense_stats,
+                    "active": condense_stats["attempted"] > 0,
+                    "applied_any": condense_stats["applied"] > 0,
+                    "final_token_count": final_sequence_length,
+                },
+            }
+            if return_layer_cls:
+                result["layer_cls_tokens"] = torch.stack(layer_cls_tokens, dim=1)
+            return result
 
         if return_layer_cls:
             return {
@@ -349,10 +521,11 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_layer_cls: bool = False):
+    def encode_image(self, image, return_layer_cls: bool = False, token_condense_config: Optional[Dict[str, Any]] = None):
         image = image.type(self.dtype)
-        if return_layer_cls and isinstance(self.visual, VisionTransformer):
-            return self.visual(image, return_layer_cls=True)
+        if isinstance(self.visual, VisionTransformer):
+            if return_layer_cls or (token_condense_config is not None and token_condense_config.get("enabled", False)):
+                return self.visual(image, return_layer_cls=return_layer_cls, token_condense_config=token_condense_config)
         return self.visual(image)
 
     def encode_text(self, text):
