@@ -248,7 +248,7 @@ class VisionTransformer(nn.Module):
     def _project_tokens(self, tokens: torch.Tensor):
         projected = self.ln_post(tokens)
         if self.proj is not None:
-            projected = projected @ self.proj
+            projected = projected @ self.proj.to(dtype=projected.dtype)
         return projected
 
     def _compute_condensation_scores(
