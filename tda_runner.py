@@ -58,6 +58,15 @@ def get_arguments():
     parser.add_argument('--tca-beta', dest='tca_beta', type=float, default=6.0, help='Affinity sharpness for TCA reservoir logits.')
     parser.add_argument('--tca-use-token-sim', dest='tca_use_token_sim', action='store_true', help='Use token-level similarity for TCA reservoir eviction.')
     parser.add_argument('--tca-diverse-cache', dest='tca_diverse_cache', action='store_true', help='Prefer diverse TCA cache entries during eviction.')
+    parser.add_argument('--enable-tca-hybrid', dest='enable_tca_hybrid', action='store_true', help='Enable uncertainty-gated TCA reservoir logits on top of the current baseline.')
+    parser.add_argument('--tca-hybrid-mode', dest='tca_hybrid_mode', type=str, choices=['off', 'always-on', 'hard-switch', 'weighted-add'], default='weighted-add', help='How to use TCA logits on uncertain samples.')
+    parser.add_argument('--tca-hybrid-entropy-threshold', dest='tca_hybrid_entropy_threshold', type=float, default=0.25, help='Normalized entropy threshold for triggering the TCA hybrid.')
+    parser.add_argument('--tca-hybrid-entropy-span', dest='tca_hybrid_entropy_span', type=float, default=0.15, help='Entropy span used to scale weighted TCA hybrid strength.')
+    parser.add_argument('--tca-hybrid-margin-threshold', dest='tca_hybrid_margin_threshold', type=float, default=0.20, help='Top-1/top-2 margin threshold for triggering the TCA hybrid.')
+    parser.add_argument('--tca-hybrid-margin-span', dest='tca_hybrid_margin_span', type=float, default=0.15, help='Margin span used to scale weighted TCA hybrid strength.')
+    parser.add_argument('--tca-hybrid-alpha-max', dest='tca_hybrid_alpha_max', type=float, default=0.5, help='Maximum fusion weight for weighted-add TCA hybrid.')
+    parser.add_argument('--tca-update-entropy-threshold', dest='tca_update_entropy_threshold', type=float, default=0.20, help='Maximum entropy for updating the TCA reservoir in hybrid mode.')
+    parser.add_argument('--tca-min-fill-ratio-for-apply', dest='tca_min_fill_ratio_for_apply', type=float, default=0.10, help='Minimum TCA reservoir fill ratio required before applying TCA logits in hybrid mode.')
     parser.add_argument('--mamba3-mode', dest='mamba3_mode', type=str, choices=['mamba3-trapezoid', 'mamba3-complex', 'mamba3-multislot'], default='mamba3-trapezoid', help='Mamba-3-inspired memory variant.')
     parser.add_argument('--mamba3-min-blend', dest='mamba3_min_blend', type=float, default=0.02, help='Minimum selective blend factor for Mamba-3-inspired memory.')
     parser.add_argument('--mamba3-max-blend', dest='mamba3_max_blend', type=float, default=0.35, help='Maximum selective blend factor for Mamba-3-inspired memory.')
@@ -160,6 +169,28 @@ def _parse_int_list(layers):
     return [int(x) for x in layers]
 
 
+def _logit_margin(logits):
+    top2 = logits.topk(min(2, logits.size(1)), dim=1).values
+    if top2.size(1) < 2:
+        return 1.0
+    return float((top2[:, 0] - top2[:, 1]).item())
+
+
+def _hybrid_weight_from_uncertainty(
+    entropy,
+    margin,
+    entropy_threshold,
+    entropy_span,
+    margin_threshold,
+    margin_span,
+    alpha_max,
+):
+    entropy_score = max(0.0, min(1.0, (float(entropy) - float(entropy_threshold)) / max(float(entropy_span), 1e-6)))
+    margin_score = max(0.0, min(1.0, (float(margin_threshold) - float(margin)) / max(float(margin_span), 1e-6)))
+    uncertainty_score = max(entropy_score, margin_score)
+    return float(max(0.0, min(float(alpha_max), float(alpha_max) * uncertainty_score)))
+
+
 def run_test_tda(
     pos_cfg,
     neg_cfg,
@@ -175,6 +206,7 @@ def run_test_tda(
     consensus_kwargs=None,
     anchor_kwargs=None,
     token_condense_kwargs=None,
+    tca_hybrid_kwargs=None,
 ):
     device = next(clip_model.parameters()).device
     if hasattr(clip_model, 'update_tca_cls_token_cache'):
@@ -211,6 +243,11 @@ def run_test_tda(
         token_condense_merged_tokens_history = []
         token_condense_layer_history = []
         tca_fill_ratio_history = []
+        tca_hybrid_trigger_history = []
+        tca_hybrid_apply_history = []
+        tca_hybrid_weight_history = []
+        tca_hybrid_logit_norm_history = []
+        tca_hybrid_entropy_trigger_history = []
         if device.type == 'cuda' and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -222,6 +259,12 @@ def run_test_tda(
         token_condense_enabled = (
             token_condense_kwargs is not None
             and token_condense_kwargs.get('enabled', False)
+            and isinstance(getattr(clip_model, 'visual', None), VisionTransformer)
+            and not use_consensus
+        )
+        tca_hybrid_enabled = (
+            tca_hybrid_kwargs is not None
+            and tca_hybrid_kwargs.get('enabled', False)
             and isinstance(getattr(clip_model, 'visual', None), VisionTransformer)
             and not use_consensus
         )
@@ -279,7 +322,7 @@ def run_test_tda(
                     clip_model,
                     clip_weights,
                     device=device,
-                    return_layer_cls=anchor_enabled,
+                    return_layer_cls=(anchor_enabled or tca_hybrid_enabled),
                     token_condense_config=token_condense_config,
                 )
                 consensus_stats = None
@@ -298,14 +341,14 @@ def run_test_tda(
                     device=device,
                     entropy_threshold=anchor_kwargs['entropy_threshold'],
                 )
-            if token_condense_enabled and tca_memory is None and visual_details.get('hidden_cls_tokens') is not None:
+            if (token_condense_enabled or tca_hybrid_enabled) and tca_memory is None and visual_details.get('hidden_cls_tokens') is not None:
                 tca_memory = TCAReservoirMemory(
                     num_classes=clip_weights.size(1),
-                    capacity=token_condense_kwargs['reservoir_size'],
+                    capacity=(token_condense_kwargs if token_condense_enabled else tca_hybrid_kwargs)['reservoir_size'],
                     device=device,
                     num_layers=visual_details['hidden_cls_tokens'].size(1),
-                    token_sim=token_condense_kwargs['use_token_sim'],
-                    diverse_cache=token_condense_kwargs['diverse_cache'],
+                    token_sim=(token_condense_kwargs if token_condense_enabled else tca_hybrid_kwargs)['use_token_sim'],
+                    diverse_cache=(token_condense_kwargs if token_condense_enabled else tca_hybrid_kwargs)['diverse_cache'],
                 )
 
             update_weight = consensus_stats['update_weight'] if use_consensus else 1.0
@@ -321,18 +364,6 @@ def run_test_tda(
                     neg_memory.update(pred, image_features, float(loss), prob_map=prob_map)
                 else:
                     neg_memory.update(pred, image_features, prop_entropy, prob_map=prob_map, update_weight=update_weight)
-
-            if tca_memory is not None:
-                tca_memory.update(
-                    pred,
-                    image_features,
-                    float(loss),
-                    visual_details.get('hidden_cls_tokens'),
-                )
-                clip_model.update_tca_cls_token_cache(tca_memory.cls_token_cache())
-                tca_fill_ratio_history.append(tca_memory.stats()['fill_ratio'])
-            else:
-                tca_fill_ratio_history.append(0.0)
 
             anchor_update_accepted = False
             if anchor_memory is not None:
@@ -359,14 +390,6 @@ def run_test_tda(
                     clip_weights,
                     (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper'])
                 )
-            if tca_memory is not None and not tca_memory.is_empty():
-                final_logits += tca_memory.logits(
-                    visual_details.get('hidden_cls_tokens'),
-                    token_condense_kwargs['scale'],
-                    token_condense_kwargs['lambd'],
-                    token_condense_kwargs['beta'],
-                    clip_weights,
-                ).to(final_logits.dtype)
             anchor_correction = None
             if anchor_memory is not None and not anchor_memory.is_empty():
                 proposed_anchor_correction = anchor_memory.logits(
@@ -379,6 +402,71 @@ def run_test_tda(
                     final_logits += anchor_correction
                 else:
                     anchor_correction_skip_count += 1
+
+            baseline_logits = final_logits.clone()
+            baseline_loss = softmax_entropy(baseline_logits)
+            baseline_entropy = get_entropy(baseline_loss, clip_weights)
+            baseline_margin = _logit_margin(baseline_logits)
+            baseline_pred = int(baseline_logits.topk(1, 1, True, True)[1].t()[0])
+
+            tca_logits = None
+            tca_apply_weight = 0.0
+            tca_triggered = False
+            tca_applied = False
+            if tca_memory is not None and not tca_memory.is_empty():
+                active_tca_kwargs = token_condense_kwargs if token_condense_enabled else tca_hybrid_kwargs
+                tca_logits = tca_memory.logits(
+                    visual_details.get('hidden_cls_tokens'),
+                    active_tca_kwargs['scale'],
+                    active_tca_kwargs['lambd'],
+                    active_tca_kwargs['beta'],
+                    clip_weights,
+                ).to(final_logits.dtype)
+
+            if tca_hybrid_enabled:
+                tca_stats = tca_memory.stats() if tca_memory is not None else {'fill_ratio': 0.0}
+                tca_ready = (
+                    tca_logits is not None
+                    and torch.isfinite(tca_logits).all()
+                    and tca_stats['fill_ratio'] >= tca_hybrid_kwargs['min_fill_ratio_for_apply']
+                )
+                if tca_hybrid_kwargs['mode'] == 'always-on':
+                    tca_triggered = True
+                else:
+                    tca_triggered = (
+                        baseline_entropy >= tca_hybrid_kwargs['entropy_threshold']
+                        or baseline_margin <= tca_hybrid_kwargs['margin_threshold']
+                    )
+                if tca_triggered and tca_ready:
+                    if tca_hybrid_kwargs['mode'] == 'always-on':
+                        final_logits += tca_logits
+                        tca_apply_weight = 1.0
+                    elif tca_hybrid_kwargs['mode'] == 'hard-switch':
+                        final_logits = clip_logits.clone() + tca_logits
+                        tca_apply_weight = 1.0
+                    else:
+                        tca_apply_weight = _hybrid_weight_from_uncertainty(
+                            baseline_entropy,
+                            baseline_margin,
+                            tca_hybrid_kwargs['entropy_threshold'],
+                            tca_hybrid_kwargs['entropy_span'],
+                            tca_hybrid_kwargs['margin_threshold'],
+                            tca_hybrid_kwargs['margin_span'],
+                            tca_hybrid_kwargs['alpha_max'],
+                        )
+                        if tca_apply_weight > 0.0:
+                            final_logits += tca_apply_weight * tca_logits
+                    tca_applied = tca_apply_weight > 0.0
+            elif tca_memory is not None and not tca_memory.is_empty():
+                final_logits += tca_logits
+
+            tca_hybrid_trigger_history.append(1.0 if tca_triggered else 0.0)
+            tca_hybrid_apply_history.append(1.0 if tca_applied else 0.0)
+            tca_hybrid_weight_history.append(float(tca_apply_weight))
+            tca_hybrid_logit_norm_history.append(
+                float(tca_logits.norm().item()) if tca_logits is not None and torch.isfinite(tca_logits).all() else 0.0
+            )
+            tca_hybrid_entropy_trigger_history.append(float(baseline_entropy) if tca_triggered else 0.0)
 
             anchor_correction_active_history.append(1.0 if anchor_correction is not None else 0.0)
             anchor_correction_norm_history.append(
@@ -399,6 +487,25 @@ def run_test_tda(
                 token_condense_kept_tokens_history.append(float(np.mean(kept_counts)) if len(kept_counts) > 0 else 0.0)
                 token_condense_merged_tokens_history.append(float(np.mean(merged_counts)) if len(merged_counts) > 0 else 0.0)
                 token_condense_layer_history.append(float(len(applied_layers)))
+
+            if tca_memory is not None:
+                tca_update_entropy = min(float(prop_entropy), float(baseline_entropy)) if tca_hybrid_enabled else float(prop_entropy)
+                tca_update_pred = baseline_pred if tca_hybrid_enabled else pred
+                if (
+                    visual_details.get('hidden_cls_tokens') is not None
+                    and torch.isfinite(visual_details.get('hidden_cls_tokens')).all()
+                    and tca_update_entropy <= (tca_hybrid_kwargs['update_entropy_threshold'] if tca_hybrid_enabled else float('inf'))
+                ):
+                    tca_memory.update(
+                        tca_update_pred,
+                        image_features,
+                        float(loss),
+                        visual_details.get('hidden_cls_tokens'),
+                    )
+                clip_model.update_tca_cls_token_cache(tca_memory.cls_token_cache())
+                tca_fill_ratio_history.append(tca_memory.stats()['fill_ratio'])
+            else:
+                tca_fill_ratio_history.append(0.0)
 
                 
             acc = cls_acc(final_logits, target)  
@@ -517,6 +624,24 @@ def run_test_tda(
                 tca_steps = np.arange(1, len(tca_fill_ratio_history) + 1, dtype=np.float64)
                 details['avg_tca_fill_ratio'] = float(tca_fill_prefix[-1] / tca_steps[-1])
                 details['tca_fill_ratio_curve'] = (tca_fill_prefix / tca_steps).tolist()
+        if tca_hybrid_enabled and len(tca_hybrid_trigger_history) > 0:
+            hybrid_steps = np.arange(1, len(tca_hybrid_trigger_history) + 1, dtype=np.float64)
+            trigger_prefix = np.cumsum(np.array(tca_hybrid_trigger_history, dtype=np.float64))
+            apply_prefix = np.cumsum(np.array(tca_hybrid_apply_history, dtype=np.float64))
+            weight_prefix = np.cumsum(np.array(tca_hybrid_weight_history, dtype=np.float64))
+            tca_norm_prefix = np.cumsum(np.array(tca_hybrid_logit_norm_history, dtype=np.float64))
+            trigger_entropy_prefix = np.cumsum(np.array(tca_hybrid_entropy_trigger_history, dtype=np.float64))
+            details['tca_hybrid_trigger_count'] = int(np.sum(tca_hybrid_trigger_history))
+            details['tca_hybrid_trigger_rate'] = float(trigger_prefix[-1] / hybrid_steps[-1])
+            details['tca_hybrid_apply_count'] = int(np.sum(tca_hybrid_apply_history))
+            details['tca_hybrid_apply_rate'] = float(apply_prefix[-1] / hybrid_steps[-1])
+            details['avg_tca_hybrid_weight'] = float(weight_prefix[-1] / hybrid_steps[-1])
+            details['avg_tca_logit_norm'] = float(tca_norm_prefix[-1] / hybrid_steps[-1])
+            if details['tca_hybrid_trigger_count'] > 0:
+                details['avg_baseline_entropy_when_triggered'] = float(
+                    trigger_entropy_prefix[-1] / max(1, details['tca_hybrid_trigger_count'])
+                )
+            details['tca_hybrid_weight_curve'] = (weight_prefix / hybrid_steps).tolist()
         if memory_type == 'ssm-mamba3' and pos_memory is not None:
             mamba3_stats = pos_memory.stats()
             details['mamba3_update_accept_count'] = mamba3_stats['accepted_updates']
@@ -591,6 +716,23 @@ def main():
         'use_token_sim': args.tca_use_token_sim,
         'diverse_cache': args.tca_diverse_cache,
     }
+    tca_hybrid_kwargs = {
+        'enabled': args.enable_tca_hybrid,
+        'mode': args.tca_hybrid_mode,
+        'reservoir_size': args.tca_reservoir_size,
+        'scale': args.tca_scale,
+        'lambd': args.tca_lambda,
+        'beta': args.tca_beta,
+        'use_token_sim': args.tca_use_token_sim,
+        'diverse_cache': args.tca_diverse_cache,
+        'entropy_threshold': args.tca_hybrid_entropy_threshold,
+        'entropy_span': args.tca_hybrid_entropy_span,
+        'margin_threshold': args.tca_hybrid_margin_threshold,
+        'margin_span': args.tca_hybrid_margin_span,
+        'alpha_max': args.tca_hybrid_alpha_max,
+        'update_entropy_threshold': args.tca_update_entropy_threshold,
+        'min_fill_ratio_for_apply': args.tca_min_fill_ratio_for_apply,
+    }
 
     consensus_kwargs = None
     if args.n_views > 0:
@@ -644,6 +786,7 @@ def main():
             consensus_kwargs=consensus_kwargs,
             anchor_kwargs=anchor_kwargs,
             token_condense_kwargs=token_condense_kwargs,
+            tca_hybrid_kwargs=tca_hybrid_kwargs,
         )
 
         if args.wandb:

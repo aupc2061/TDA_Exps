@@ -547,6 +547,8 @@ def run_head_to_head(args):
                                 f'_tca_dr{args.tca_drop_rate}'
                                 f'_rs{args.tca_reservoir_size}'
                             )
+                        if args.enable_tca_hybrid:
+                            method_name += f'_tcah_{args.tca_hybrid_mode}'
 
                         if args.wandb_log:
                             import wandb
@@ -591,6 +593,23 @@ def run_head_to_head(args):
                                 'use_token_sim': args.tca_use_token_sim,
                                 'diverse_cache': args.tca_diverse_cache,
                             } if args.enable_token_condensation else None,
+                            tca_hybrid_kwargs={
+                                'enabled': args.enable_tca_hybrid,
+                                'mode': args.tca_hybrid_mode,
+                                'reservoir_size': args.tca_reservoir_size,
+                                'scale': args.tca_scale,
+                                'lambd': args.tca_lambda,
+                                'beta': args.tca_beta,
+                                'use_token_sim': args.tca_use_token_sim,
+                                'diverse_cache': args.tca_diverse_cache,
+                                'entropy_threshold': args.tca_hybrid_entropy_threshold,
+                                'entropy_span': args.tca_hybrid_entropy_span,
+                                'margin_threshold': args.tca_hybrid_margin_threshold,
+                                'margin_span': args.tca_hybrid_margin_span,
+                                'alpha_max': args.tca_hybrid_alpha_max,
+                                'update_entropy_threshold': args.tca_update_entropy_threshold,
+                                'min_fill_ratio_for_apply': args.tca_min_fill_ratio_for_apply,
+                            } if args.enable_tca_hybrid else None,
                         )
 
                         if args.wandb_log:
@@ -625,6 +644,15 @@ def run_head_to_head(args):
                             row['tca_scale'] = args.tca_scale
                             row['tca_lambda'] = args.tca_lambda
                             row['tca_beta'] = args.tca_beta
+                        if args.enable_tca_hybrid:
+                            row['tca_hybrid_mode'] = args.tca_hybrid_mode
+                            row['tca_hybrid_entropy_threshold'] = args.tca_hybrid_entropy_threshold
+                            row['tca_hybrid_entropy_span'] = args.tca_hybrid_entropy_span
+                            row['tca_hybrid_margin_threshold'] = args.tca_hybrid_margin_threshold
+                            row['tca_hybrid_margin_span'] = args.tca_hybrid_margin_span
+                            row['tca_hybrid_alpha_max'] = args.tca_hybrid_alpha_max
+                            row['tca_update_entropy_threshold'] = args.tca_update_entropy_threshold
+                            row['tca_min_fill_ratio_for_apply'] = args.tca_min_fill_ratio_for_apply
                         for key in [
                             'anchor_update_accept_count',
                             'anchor_update_attempt_count',
@@ -649,6 +677,13 @@ def run_head_to_head(args):
                             'tca_update_accept_rate',
                             'tca_fill_ratio',
                             'avg_tca_fill_ratio',
+                            'tca_hybrid_trigger_count',
+                            'tca_hybrid_trigger_rate',
+                            'tca_hybrid_apply_count',
+                            'tca_hybrid_apply_rate',
+                            'avg_tca_hybrid_weight',
+                            'avg_tca_logit_norm',
+                            'avg_baseline_entropy_when_triggered',
                         ]:
                             if key in result:
                                 row[key] = result[key]
@@ -677,6 +712,8 @@ def run_head_to_head(args):
                                 curve_row['token_condense_apply_rate'] = result['token_condense_apply_rate_curve'][step]
                             if 'tca_fill_ratio_curve' in result:
                                 curve_row['tca_fill_ratio'] = result['tca_fill_ratio_curve'][step]
+                            if 'tca_hybrid_weight_curve' in result:
+                                curve_row['tca_hybrid_weight'] = result['tca_hybrid_weight_curve'][step]
                             curve_rows.append(curve_row)
 
             # Consensus-gated SSM runs
@@ -927,6 +964,15 @@ def get_args():
     parser.add_argument('--tca-beta', type=float, default=6.0, help='Affinity sharpness for TCA reservoir logits.')
     parser.add_argument('--tca-use-token-sim', action='store_true', help='Use token-level similarity for TCA reservoir eviction.')
     parser.add_argument('--tca-diverse-cache', action='store_true', help='Prefer diverse samples in the TCA cache.')
+    parser.add_argument('--enable-tca-hybrid', action='store_true', help='Enable uncertainty-gated TCA reservoir logits on top of the current baseline.')
+    parser.add_argument('--tca-hybrid-mode', type=str, choices=['off', 'always-on', 'hard-switch', 'weighted-add'], default='weighted-add', help='How to use TCA logits on uncertain samples.')
+    parser.add_argument('--tca-hybrid-entropy-threshold', type=float, default=0.25, help='Entropy threshold for triggering the TCA hybrid.')
+    parser.add_argument('--tca-hybrid-entropy-span', type=float, default=0.15, help='Entropy span for scaling weighted TCA hybrid strength.')
+    parser.add_argument('--tca-hybrid-margin-threshold', type=float, default=0.20, help='Margin threshold for triggering the TCA hybrid.')
+    parser.add_argument('--tca-hybrid-margin-span', type=float, default=0.15, help='Margin span for scaling weighted TCA hybrid strength.')
+    parser.add_argument('--tca-hybrid-alpha-max', type=float, default=0.5, help='Maximum fusion weight for weighted-add TCA hybrid.')
+    parser.add_argument('--tca-update-entropy-threshold', type=float, default=0.20, help='Maximum entropy for updating the TCA reservoir in hybrid mode.')
+    parser.add_argument('--tca-min-fill-ratio-for-apply', type=float, default=0.10, help='Minimum TCA reservoir fill ratio before applying TCA logits.')
     return parser.parse_args()
 
 
