@@ -55,6 +55,28 @@ class LCPlusMamba3CacheMemory:
         entropy_temp=4.0,
         phase_strength=0.15,
         state_logit_weight=0.5,
+        use_feature_centering=True,
+        center_strength=0.25,
+        center_warmup=30,
+        center_decay=0.995,
+        use_fisher_gate=True,
+        use_mimo=True,
+        use_logit_rebalance=True,
+        rebalance_strength=0.3,
+        rebalance_warmup=30,
+        use_transductive=True,
+        trans_buffer_size=200,
+        trans_k=5,
+        trans_weight=0.3,
+        trans_warmup=20,
+        trans_confidence_gate=0.4,
+        use_ncm=True,
+        ncm_weight=5.0,
+        ncm_warmup=30,
+        ncm_min_classes=3,
+        use_discriminative_rescaling=True,
+        rescale_strength=0.3,
+        rescale_warmup=5,
     ):
         self.num_classes = num_classes
         self.feature_dim = feature_dim
@@ -68,6 +90,28 @@ class LCPlusMamba3CacheMemory:
         self.phase_strength = phase_strength if mode == "mamba3-complex" else 0.0
         self.state_logit_weight = state_logit_weight
         self.eps = 1e-8
+        self.use_feature_centering = use_feature_centering
+        self.center_strength = center_strength
+        self.center_warmup = center_warmup
+        self.center_decay = center_decay
+        self.use_fisher_gate = use_fisher_gate
+        self.use_mimo = use_mimo
+        self.use_logit_rebalance = use_logit_rebalance
+        self.rebalance_strength = rebalance_strength
+        self.rebalance_warmup = rebalance_warmup
+        self.use_transductive = use_transductive
+        self.trans_buffer_size = trans_buffer_size
+        self.trans_k = trans_k
+        self.trans_weight = trans_weight
+        self.trans_warmup = trans_warmup
+        self.trans_confidence_gate = trans_confidence_gate
+        self.use_ncm = use_ncm
+        self.ncm_weight = ncm_weight
+        self.ncm_warmup = ncm_warmup
+        self.ncm_min_classes = ncm_min_classes
+        self.use_discriminative_rescaling = use_discriminative_rescaling
+        self.rescale_strength = rescale_strength
+        self.rescale_warmup = rescale_warmup
 
         self.cache = {}
         self.state_keys = torch.zeros(num_classes, feature_dim, dtype=torch.float32, device=device)
@@ -75,6 +119,12 @@ class LCPlusMamba3CacheMemory:
         self.seen = torch.zeros(num_classes, dtype=torch.bool, device=device)
         self.total_updates_seen = 0
         self.accepted_updates = 0
+        self.fisher_rejections = 0
+        self.mimo_applications = 0
+        self.running_center = torch.zeros(feature_dim, dtype=torch.float32, device=device)
+        self.center_updates = 0
+        self.trans_features = []
+        self.trans_logits = []
 
     def is_empty(self):
         return len(self.cache) == 0 and not bool(torch.any(self.seen).item())
@@ -92,7 +142,21 @@ class LCPlusMamba3CacheMemory:
         rotated[1:n:2] = s * vector[:n:2] + c * vector[1:n:2]
         return rotated
 
+    def _cache_admission_allowed(self, pred, feature, loss):
+        if not self.use_fisher_gate or pred not in self.cache or len(self.cache[pred]) == 0:
+            return True
+        obs = F.normalize(feature.squeeze(0).float(), dim=-1)
+        class_feats = torch.stack([F.normalize(item[0].squeeze(0).float(), dim=-1) for item in self.cache[pred]], dim=0)
+        max_sim = float((class_feats @ obs).max().item())
+        worst_loss = max(float(item[1]) for item in self.cache[pred])
+        if max_sim > 0.985 and float(loss) >= worst_loss:
+            self.fisher_rejections += 1
+            return False
+        return True
+
     def _update_cache(self, pred, feature, loss):
+        if self.shot_capacity <= 0 or not self._cache_admission_allowed(pred, feature, loss):
+            return
         item = [feature.detach(), float(loss)]
         if pred not in self.cache:
             self.cache[pred] = [item]
@@ -132,15 +196,44 @@ class LCPlusMamba3CacheMemory:
         updated = alpha_t * prev + beta_t * prev_input + gamma_t * obs
         self.state_keys[pred] = F.normalize(updated, dim=-1)
         self.prev_inputs[pred] = obs
+        self._apply_mimo(pred)
+
+    def _apply_mimo(self, pred):
+        if not self.use_mimo or not self.seen[pred]:
+            return
+        others = torch.where(self.seen)[0]
+        others = others[others != pred]
+        if others.numel() == 0:
+            return
+        state = self.state_keys[pred]
+        other_mean = F.normalize(self.state_keys[others].mean(dim=0), dim=-1)
+        state = state - 0.05 * torch.dot(state, other_mean) * other_mean
+        self.state_keys[pred] = F.normalize(state, dim=-1)
+        self.mimo_applications += 1
+
+    def _update_center(self, feature):
+        obs = feature.squeeze(0).float()
+        if self.center_updates == 0:
+            self.running_center = obs.detach().clone()
+        else:
+            self.running_center = self.center_decay * self.running_center + (1.0 - self.center_decay) * obs
+        self.center_updates += 1
 
     def update(self, pred, feature, loss, prop_entropy=0.0, clip_weights=None):
         with torch.no_grad():
             self.total_updates_seen += 1
             pred = int(pred)
+            self._update_center(feature)
             self._update_cache(pred, feature, loss)
             self._update_state(pred, feature, prop_entropy)
             self.accepted_updates += 1
             return True
+
+    def center_features(self, image_features, clip_weights=None):
+        if not self.use_feature_centering or self.center_updates < self.center_warmup:
+            return image_features
+        centered = image_features.float() - self.center_strength * F.normalize(self.running_center, dim=-1).unsqueeze(0)
+        return F.normalize(centered, dim=-1).to(image_features.dtype)
 
     def _cache_logits(self, image_features, alpha, beta, clip_weights):
         if len(self.cache) == 0:
@@ -172,15 +265,114 @@ class LCPlusMamba3CacheMemory:
         state_logits = self._state_logits(image_features, alpha, beta, clip_weights)
         return cache_logits + self.state_logit_weight * state_logits
 
+    def get_ncm_logits(self, image_features):
+        if not self.use_ncm or self.total_updates_seen < self.ncm_warmup or len(self.cache) < self.ncm_min_classes:
+            return None
+        query = F.normalize(image_features.squeeze(0).float(), dim=-1)
+        logits = torch.zeros(self.num_classes, device=self.device, dtype=torch.float32)
+        for class_idx, items in self.cache.items():
+            if len(items) == 0:
+                continue
+            feats = torch.stack([item[0].squeeze(0).float() for item in items], dim=0)
+            losses = torch.tensor([float(item[1]) for item in items], device=self.device, dtype=torch.float32)
+            weights = torch.softmax(-losses, dim=0)
+            proto = F.normalize((feats * weights.unsqueeze(1)).sum(dim=0), dim=-1)
+            reliability = min(1.0, len(items) / max(1, self.shot_capacity))
+            logits[int(class_idx)] = self.ncm_weight * reliability * torch.dot(query, proto)
+        return logits.unsqueeze(0).to(image_features.dtype)
+
+    def get_logit_adjustment(self):
+        if not self.use_logit_rebalance or self.total_updates_seen < self.rebalance_warmup or len(self.cache) == 0:
+            return None
+        counts = torch.zeros(self.num_classes, device=self.device, dtype=torch.float32)
+        for class_idx, items in self.cache.items():
+            counts[int(class_idx)] = float(len(items))
+        active = counts > 0
+        if not bool(active.any().item()):
+            return None
+        prior = counts / counts.sum().clamp_min(1.0)
+        uniform = torch.zeros_like(prior)
+        uniform[active] = 1.0 / active.float().sum().clamp_min(1.0)
+        adjustment = self.rebalance_strength * torch.log((uniform + self.eps) / (prior + self.eps))
+        adjustment[~active] = 0.0
+        return adjustment.unsqueeze(0)
+
+    def _update_transductive(self, feature, logits, prop_entropy):
+        if not self.use_transductive:
+            return
+        probs = logits.softmax(dim=-1)
+        confidence = float(probs.max().item())
+        if confidence < self.trans_confidence_gate:
+            return
+        self.trans_features.append(F.normalize(feature.squeeze(0).float(), dim=-1).detach())
+        self.trans_logits.append(logits.detach().float())
+        if len(self.trans_features) > self.trans_buffer_size:
+            self.trans_features.pop(0)
+            self.trans_logits.pop(0)
+
+    def get_transductive_logits(self, image_features):
+        if not self.use_transductive or self.total_updates_seen < self.trans_warmup or len(self.trans_features) < self.trans_k:
+            return None
+        query = F.normalize(image_features.squeeze(0).float(), dim=-1)
+        feats = torch.stack(self.trans_features, dim=0)
+        sims = feats @ query
+        k = min(self.trans_k, sims.numel())
+        vals, idx = torch.topk(sims, k=k)
+        weights = torch.softmax(vals / 0.07, dim=0)
+        neigh_logits = torch.stack([self.trans_logits[int(i.item())].squeeze(0) for i in idx], dim=0)
+        return self.trans_weight * (weights.unsqueeze(1) * neigh_logits).sum(dim=0, keepdim=True).to(image_features.dtype)
+
+    def get_discriminative_logits(self, image_features, clip_weights):
+        if (
+            not self.use_discriminative_rescaling
+            or self.total_updates_seen < self.rescale_warmup
+            or len(self.cache) < 2
+        ):
+            return None
+        protos = []
+        classes = []
+        for class_idx, items in self.cache.items():
+            if len(items) == 0:
+                continue
+            feats = torch.stack([item[0].squeeze(0).float() for item in items], dim=0)
+            protos.append(F.normalize(feats.mean(dim=0), dim=-1))
+            classes.append(int(class_idx))
+        if len(protos) < 2:
+            return None
+        proto_stack = torch.stack(protos, dim=0)
+        variance = proto_stack.var(dim=0)
+        scale = 1.0 + self.rescale_strength * variance / variance.mean().clamp_min(self.eps)
+        query = F.normalize(image_features.squeeze(0).float() * scale, dim=-1)
+        logits = torch.zeros(self.num_classes, device=self.device, dtype=torch.float32)
+        for cls, proto in zip(classes, proto_stack):
+            logits[cls] = torch.dot(query, F.normalize(proto * scale, dim=-1))
+        return logits.unsqueeze(0).to(image_features.dtype)
+
     def stats(self):
         cache_entries = sum(len(items) for items in self.cache.values())
         active_classes = int(torch.sum(self.seen).item())
+        disc_active_dims = 0
+        if self.use_discriminative_rescaling and len(self.cache) >= 2:
+            protos = []
+            for items in self.cache.values():
+                if len(items) > 0:
+                    protos.append(torch.stack([item[0].squeeze(0).float() for item in items], dim=0).mean(dim=0))
+            if len(protos) >= 2:
+                variance = torch.stack(protos, dim=0).var(dim=0)
+                disc_active_dims = int((variance > variance.mean()).sum().item())
         return {
             "accepted_updates": int(self.accepted_updates),
             "total_update_attempts": int(self.total_updates_seen),
             "accept_rate": float(self.accepted_updates / self.total_updates_seen) if self.total_updates_seen else 0.0,
             "cache_entries": int(cache_entries),
             "active_state_classes": active_classes,
+            "ncm_active_classes": int(sum(1 for items in self.cache.values() if len(items) > 0)),
+            "trans_buffer_size": int(len(self.trans_features)),
+            "feature_center_norm": float(self.running_center.norm().item()) if self.center_updates > 0 else 0.0,
+            "rebalance_active": int(self.use_logit_rebalance and self.total_updates_seen >= self.rebalance_warmup),
+            "fisher_rejections": int(self.fisher_rejections),
+            "mimo_applications": int(self.mimo_applications),
+            "disc_active_dims": int(disc_active_dims),
         }
 
     def memory_bytes(self):
@@ -307,17 +499,41 @@ def score_with_state(
     anchor_beta=1.5,
     anchor_norm_accumulator=None,
 ):
-    final_logits = clip_logits.clone()
+    scoring_features = image_features
+    if pos_memory is not None and hasattr(pos_memory, "center_features"):
+        scoring_features = pos_memory.center_features(scoring_features, clip_weights)
+
+    if scoring_features is not image_features:
+        final_logits = 100.0 * scoring_features.float() @ clip_weights.float()
+    else:
+        final_logits = clip_logits.clone()
+
     if pos_memory is not None and not pos_memory.is_empty():
-        final_logits += pos_memory.logits(image_features, pos_params["alpha"], pos_params["beta"], clip_weights)
+        final_logits += pos_memory.logits(scoring_features, pos_params["alpha"], pos_params["beta"], clip_weights)
     if neg_memory is not None and not neg_memory.is_empty():
         final_logits -= neg_memory.logits(
-            image_features,
+            scoring_features,
             neg_params["alpha"],
             neg_params["beta"],
             clip_weights,
             (neg_params["mask_threshold"]["lower"], neg_params["mask_threshold"]["upper"]),
         )
+    if pos_memory is not None and hasattr(pos_memory, "get_ncm_logits"):
+        ncm_logits = pos_memory.get_ncm_logits(scoring_features)
+        if ncm_logits is not None:
+            final_logits += ncm_logits.to(final_logits.dtype)
+    if pos_memory is not None and hasattr(pos_memory, "get_logit_adjustment"):
+        logit_adjustment = pos_memory.get_logit_adjustment()
+        if logit_adjustment is not None:
+            final_logits += logit_adjustment.to(final_logits.dtype)
+    if pos_memory is not None and hasattr(pos_memory, "get_transductive_logits"):
+        transductive_logits = pos_memory.get_transductive_logits(scoring_features)
+        if transductive_logits is not None:
+            final_logits += transductive_logits.to(final_logits.dtype)
+    if pos_memory is not None and hasattr(pos_memory, "get_discriminative_logits"):
+        discriminative_logits = pos_memory.get_discriminative_logits(scoring_features, clip_weights)
+        if discriminative_logits is not None:
+            final_logits += discriminative_logits.to(final_logits.dtype)
     if anchor_memory is not None and not anchor_memory.is_empty() and layer_cls_tokens is not None:
         anchor_logits = anchor_memory.logits(layer_cls_tokens, anchor_alpha, anchor_beta).to(final_logits.dtype)
         if torch.isfinite(anchor_logits).all():
@@ -411,6 +627,13 @@ def run_lc_plus_anchor(
     anchor_beta=1.5,
     mamba_mode="mamba3-trapezoid",
     state_logit_weight=0.5,
+    use_feature_centering=True,
+    use_fisher_gate=True,
+    use_mimo=True,
+    use_ncm=True,
+    use_logit_rebalance=True,
+    use_transductive=True,
+    use_discriminative_rescaling=True,
 ):
     pos_params = {k: pos_cfg[k] for k in ["shot_capacity", "alpha", "beta"]}
     neg_params = {k: neg_cfg[k] for k in ["shot_capacity", "alpha", "beta", "entropy_threshold", "mask_threshold"]}
@@ -424,6 +647,13 @@ def run_lc_plus_anchor(
         shot_capacity=pos_params["shot_capacity"],
         mode=mamba_mode,
         state_logit_weight=state_logit_weight,
+        use_feature_centering=use_feature_centering,
+        use_fisher_gate=use_fisher_gate,
+        use_mimo=use_mimo,
+        use_ncm=use_ncm,
+        use_logit_rebalance=use_logit_rebalance,
+        use_transductive=use_transductive,
+        use_discriminative_rescaling=use_discriminative_rescaling,
     )
     neg_memory = CacheMemory(shot_capacity=neg_params["shot_capacity"], include_prob_map=True)
     multi_ssm = MultiStateSSM(num_classes, feature_dim, num_states, spawn_threshold, device=device) if use_multi_state else None
@@ -466,6 +696,8 @@ def run_lc_plus_anchor(
             anchor_beta,
             anchor_norms,
         )
+        if hasattr(pos_memory, "_update_transductive"):
+            pos_memory._update_transductive(image_features, tentative_logits, prop_entropy)
 
         buffer.append({
             "idx": sample_idx,
@@ -633,8 +865,15 @@ def parse_args():
     parser.add_argument("--multi-state", action="store_true")
     parser.add_argument("--num-states", type=int, default=3)
     parser.add_argument("--spawn-threshold", type=float, default=0.5)
-    parser.add_argument("--blend-policy", choices=["entropy-min", "agreement-gated"], default="agreement-gated")
+    parser.add_argument("--blend-policy", choices=["entropy-min", "agreement-gated"], default="entropy-min")
     parser.add_argument("--blend-confidence-gate", type=float, default=0.70)
+    parser.add_argument("--disable-feature-centering", action="store_true")
+    parser.add_argument("--disable-fisher-gate", action="store_true")
+    parser.add_argument("--disable-mimo", action="store_true")
+    parser.add_argument("--disable-ncm", action="store_true")
+    parser.add_argument("--disable-logit-rebalance", action="store_true")
+    parser.add_argument("--disable-transductive", action="store_true")
+    parser.add_argument("--disable-discriminative-rescaling", action="store_true")
     parser.add_argument("--enable-anchor-reservoir", action="store_true")
     parser.add_argument("--anchor-reservoir-size", type=int, default=2)
     parser.add_argument("--anchor-entropy-threshold", type=float, default=0.15)
@@ -668,7 +907,9 @@ def main():
         writer.writerow([
             "dataset", "method", "accuracy", "lc_acc", "pass1_acc", "proto_acc", "blend_acc",
             "method_used", "proto_classes", "blend_from_proto", "anchor_update_accept_rate",
-            "anchor_fill_ratio", "avg_anchor_correction_norm", "cache_entries", "time_sec",
+            "anchor_fill_ratio", "avg_anchor_correction_norm", "ncm_active_classes",
+            "trans_buffer_size", "feature_center_norm", "rebalance_active", "fisher_rejections",
+            "mimo_applications", "disc_active_dims", "cache_entries", "time_sec",
         ])
 
         for dataset_name in args.datasets.split("/"):
@@ -729,6 +970,13 @@ def main():
                 anchor_beta=args.anchor_beta,
                 mamba_mode=args.mamba3_mode,
                 state_logit_weight=args.state_logit_weight,
+                use_feature_centering=not args.disable_feature_centering,
+                use_fisher_gate=not args.disable_fisher_gate,
+                use_mimo=not args.disable_mimo,
+                use_ncm=not args.disable_ncm,
+                use_logit_rebalance=not args.disable_logit_rebalance,
+                use_transductive=not args.disable_transductive,
+                use_discriminative_rescaling=not args.disable_discriminative_rescaling,
             )
             elapsed = time.time() - start
             print(
@@ -751,6 +999,13 @@ def main():
                 f"{stats['anchor_update_accept_rate']:.4f}",
                 f"{stats['anchor_fill_ratio']:.4f}",
                 f"{stats['avg_anchor_correction_norm']:.4f}",
+                stats.get("ncm_active_classes", 0),
+                stats.get("trans_buffer_size", 0),
+                f"{stats.get('feature_center_norm', 0.0):.4f}",
+                stats.get("rebalance_active", 0),
+                stats.get("fisher_rejections", 0),
+                stats.get("mimo_applications", 0),
+                stats.get("disc_active_dims", 0),
                 stats.get("cache_entries", 0),
                 f"{elapsed:.1f}",
             ])
